@@ -12,7 +12,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import cv2
 
-from network import Network
+from network import Network, ADELoss
 
 NUM_WAYPOINTS = 10
 
@@ -36,7 +36,7 @@ class MLDataset(Dataset):
         image_norm = image.astype(np.float32)
 
         image_tensor = torch.from_numpy(image_norm).unsqueeze(0)
-        trajectory_tensor = torch.tensor(waypoints, dtype=torch.float32).flatten()
+        trajectory_tensor = torch.tensor(waypoints, dtype=torch.float32)
 
         return image_tensor, trajectory_tensor
     
@@ -62,8 +62,8 @@ class Trainer:
     def __init__(self, config):
         self.config = config
         self.model = Network(num_waypoints=NUM_WAYPOINTS)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.learning_rate)
-        self.loss = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
+        self.loss = ADELoss()
         
     def train(self, dataloader):
         self.model.to(self.config.device)
@@ -106,4 +106,3 @@ def main():
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
     trainer = Trainer(config)
     trainer.train(dataloader)
-
