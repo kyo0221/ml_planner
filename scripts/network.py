@@ -33,4 +33,10 @@ class Network(nn.Module):
     def forward(self, x):
         x = self.features(x)
         x = self.mlp(x)
-        return x
+        return x.view(x.shape[0], self.num_waypoints, 2)
+
+
+class ADELoss(nn.Module):
+    def forward(self, pred, target):
+        l2 = torch.linalg.norm(pred - target, dim=-1)
+        return l2.mean()
