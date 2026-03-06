@@ -1,0 +1,4 @@
+planner_node:
+  ros__parameters:
+    model_name: model.pt
+    interval_ms: 100
