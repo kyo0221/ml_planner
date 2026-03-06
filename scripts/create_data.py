@@ -84,10 +84,10 @@ class DataCreator(Node):
         self.collect_flag = not self.collect_flag
         if self.collect_flag:
             self.window.clear()
-            self.get_logger().info('Create data started')
+            self.get_logger().info('⚪Create data started')
         else:
             self.window.clear()
-            self.get_logger().info('Data collect stopped')
+            self.get_logger().info('🔴Data collect stopped')
 
     def timer_callback(self):
         if not self.zed.grab():
@@ -110,11 +110,11 @@ class DataCreator(Node):
         future_odoms = [sample['odom'] for sample in samples[1:]]
         trajectory = Trajectory.from_odoms(future_odoms)
         if trajectory is None:
-            self.get_logger().info('Skipped sample: trajectory contains non-OK odom state')
+            self.get_logger().info('🟡Skipped sample: trajectory contains non-OK odom state')
             return
 
         self.collected_data.append((image_at_t, trajectory))
-        self.get_logger().info(f'Collected data #{len(self.collected_data)}')
+        self.get_logger().info(f'🟢Collected data #{len(self.collected_data)}')
 
     def publisher_odom(self, odom):
         msg = Odometry()
@@ -136,7 +136,7 @@ class DataCreator(Node):
 
     def save_data(self) -> None:
         if len(self.collected_data) == 0:
-            self.get_logger().info('No data to save')
+            self.get_logger().info('🔴No data to save')
             return
 
         package_root = Path(__file__).parent.parent
@@ -162,7 +162,7 @@ class DataCreator(Node):
                 for point in trajectory.points:
                     csv_writer.writerow([point['x'], point['y']])
 
-        self.get_logger().info(f'Saved {len(self.collected_data)} samples to {dataset_dir}')
+        self.get_logger().info(f'🔵Saved {len(self.collected_data)} samples to {dataset_dir}')
 
 
 def main(args=None) -> None:
