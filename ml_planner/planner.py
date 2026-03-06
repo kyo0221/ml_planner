@@ -19,7 +19,7 @@ from ml_planner.zed_api_utils import ZED_API_Utils
 
 class PlannerNode(Node):
     def __init__(self):
-        super.__init__('planner_node')
+        super().__init__('planner_node')
         self.init_ros_parameter()
         self.init_torch_model()
         self.zed = ZED_API_Utils()
@@ -90,3 +90,19 @@ class PlannerNode(Node):
         path_msg.poses.extend(PoseStamped(header=path_msg.header, pose=Pose(position=Point(x=float(x_smooth[i]), y=float(y_smooth[i])))) for i in range(len(x_smooth)))
 
         return path_msg
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PlannerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
