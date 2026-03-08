@@ -19,7 +19,7 @@ class ZED_API_Utils:
 
     def init_param(self):
         init = sl.InitParameters()
-        init.camera_resolution = sl.RESOLUTION.SVGA
+        init.camera_resolution = sl.RESOLUTION.HD720
         init.camera_fps = 15
         init.coordinate_units = sl.UNIT.METER
         init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP
@@ -30,9 +30,8 @@ class ZED_API_Utils:
 
     def init_tracking_param(self):
         tracking_params = sl.PositionalTrackingParameters()
-        tracking_params.init_pos = sl.Transform()
-        tracking_params._enable_area_memory = True
-        tracking_params._enable_pose_smoothing = True
+        tracking_params.enable_area_memory = True
+        tracking_params.enable_pose_smoothing = True
         tracking_params.enable_imu_fusion = False
 
         err = self.zed.enable_positional_tracking(tracking_params)
@@ -43,7 +42,7 @@ class ZED_API_Utils:
         return self.zed.grab(self.runtime) == sl.ERROR_CODE.SUCCESS
 
     def get_image(self):
-        self.zed.retrieve_image(self.image, sl.VIEW.LEFT, sl.Resolution(960 // 4, 600 // 4))
+        self.zed.retrieve_image(self.image, sl.VIEW.LEFT, sl.MEM.CPU, sl.Resolution(960 // 4, 600 // 4))
         img = self.image.get_data()
 
         return img
