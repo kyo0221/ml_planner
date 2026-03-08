@@ -22,7 +22,7 @@ class ZED_API_Utils:
         init.camera_resolution = sl.RESOLUTION.HD720
         init.camera_fps = 15
         init.coordinate_units = sl.UNIT.METER
-        init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP
+        init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
 
         err = self.zed.open(init)
         if err != sl.ERROR_CODE.SUCCESS:
@@ -48,7 +48,7 @@ class ZED_API_Utils:
         return img
     
     def get_odom(self):
-        state = self.zed.get_position(self.pose, sl.REFERENCE_FRAME.CAMERA)
+        state = self.zed.get_position(self.pose, sl.REFERENCE_FRAME.WORLD)
 
         translation = self.pose.get_translation(self.translation).get()
         orientation = self.pose.get_orientation(self.orientation).get()
