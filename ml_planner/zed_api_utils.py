@@ -67,5 +67,5 @@ class ZED_API_Utils:
                 'z': float(orientation[2]),
                 'w': float(orientation[3]),
             },
-            'pose_confidence': self.pose.pose_confidence(),
+            'pose_confidence': self.pose.pose_confidence,
         }
