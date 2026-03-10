@@ -14,33 +14,31 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import cv2
 
-from network import Network, ADELoss
+from network import Network
 
-NUM_WAYPOINTS = 10
 
 class MLDataset(Dataset):
     def __init__(self, dataset_path: str):
         self.image_dir = dataset_path + '/images'
-        self.path_dir = dataset_path + '/paths'
+        self.action_dir = dataset_path + '/actions'
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
         img_file = self.image_dir[idx]
-        csv_file = self.path_dir / f'{img_file.stem}.csv'
+        csv_file = self.action_dir / f'{img_file.stem}.csv'
 
         image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
-        with open(csv_file, 'r') as f:
-            reader = csv.DictReader(f)
-            waypoints = [[float(row['x']), float(row['y'])] for row in reader]
-
         image_norm = image.astype(np.float32)
-
         image_tensor = torch.from_numpy(image_norm).unsqueeze(0)
-        trajectory_tensor = torch.tensor(waypoints, dtype=torch.float32)
 
-        return image_tensor, trajectory_tensor
+        with open(csv_file, 'r', newline='') as f:
+            row = next(csv.reader(f))
+
+        action_tensor = torch.tensor(float(row[1]), dtype=torch.float32)
+        return image_tensor, action_tensor
+    
     
 class Config:
     def __init__(self, config_path, package_root):
@@ -60,12 +58,13 @@ class Config:
 
         self.device = torch.device('cuda')
 
+
 class Trainer:
     def __init__(self, config):
         self.config = config
-        self.model = Network(num_waypoints=NUM_WAYPOINTS)
+        self.model = Network()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
-        self.loss = ADELoss()
+        self.loss = nn.MSELoss()
         
     def train(self, dataloader):
         self.model.to(self.config.device)
@@ -74,13 +73,13 @@ class Trainer:
             self.model.train()
             total_loss = 0.0
 
-            for images, trajectories in dataloader:
-                images = images.to(self.config.device)
-                trajectories = trajectories.to(self.config.device)
+            for image, action in dataloader:
+                image = image.to(self.config.device)
+                action = action.to(self.config.device)
 
                 self.optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = self.loss(outputs, trajectories)
+                outputs = self.model(image)
+                loss = self.loss(outputs, action)
                 loss.backward()
                 self.optimizer.step()
 
