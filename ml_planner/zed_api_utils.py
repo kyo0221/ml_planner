@@ -27,7 +27,7 @@ class ZED_API_Utils:
         return self.zed.grab(self.runtime) == sl.ERROR_CODE.SUCCESS
 
     def get_image(self):
-        self.zed.retrieve_image(self.image, sl.VIEW.LEFT, sl.Resolution(960 // 4, 600 // 4))
+        self.zed.retrieve_image(self.image, sl.VIEW.LEFT, sl.Resolution(960 // 2, 600 // 2))
         img = self.image.get_data()
 
         return img
