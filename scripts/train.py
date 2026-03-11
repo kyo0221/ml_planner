@@ -1,42 +1,47 @@
 #!/usr/bin/env python3
 
-import os
+import csv
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
-
-import yaml
-import csv
-
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import cv2
+from torch.utils.data import DataLoader, Dataset
+import yaml
 
 from network import Network
+from utils.slit_augment import SlitAugment
 
 
 class MLDataset(Dataset):
     def __init__(self, dataset_path: str):
-        self.image_dir = dataset_path + '/images'
-        self.action_dir = dataset_path + '/actions'
+        dataset_root = Path(dataset_path)
+        self.image_dir = dataset_root / 'images'
+        self.action_dir = dataset_root / 'actions'
+        self.image_paths = sorted(self.image_dir.glob('*.png'))
+        self.augmentor = SlitAugment()
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.image_paths) * len(self.augmentor)
 
     def __getitem__(self, idx):
-        img_file = self.image_dir[idx]
+        image_idx = idx // len(self.augmentor)
+        augment_idx = idx % len(self.augmentor)
+        img_file = self.image_paths[image_idx]
         csv_file = self.action_dir / f'{img_file.stem}.csv'
 
         image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
-        image_norm = image.astype(np.float32)
-        image_tensor = torch.from_numpy(image_norm).unsqueeze(0)
-
         with open(csv_file, 'r', newline='') as f:
-            row = next(csv.reader(f))
+            angular_z = float(next(csv.reader(f))[1])
 
-        action_tensor = torch.tensor(float(row[1]), dtype=torch.float32)
+        image, angular_z = self.augmentor.get_augmented(image, angular_z, augment_idx)
+
+        image = image.astype(np.float32) / 255.0
+        image = np.transpose(image, (2, 0, 1))
+        image_tensor = torch.from_numpy(image)
+        action_tensor = torch.tensor([angular_z], dtype=torch.float32)
         return image_tensor, action_tensor
     
     
