@@ -27,7 +27,7 @@ class ZED_API_Utils:
         return self.zed.grab(self.runtime) == sl.ERROR_CODE.SUCCESS
 
     def get_image(self):
-        self.zed.retrieve_image(self.image, sl.VIEW.LEFT, sl.Resolution(1280 // 4, 720 // 4))
+        self.zed.retrieve_image(self.image, sl.VIEW.LEFT, sl.Resolution(512, 288)) # 最終的に288x288の画像を想定
         img = self.image.get_data()
 
         return img
