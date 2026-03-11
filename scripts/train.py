@@ -112,3 +112,6 @@ def main():
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
     trainer = Trainer(config)
     trainer.train(dataloader)
+
+if __name__ == '__main__':
+    main()
