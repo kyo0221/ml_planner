@@ -84,7 +84,7 @@ class Trainer:
         self.model = Network()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
         self.loss = nn.MSELoss()
-        self.writer = SummaryWriter(self.logs_dir)
+        self.writer = SummaryWriter(config.logs_dir)
         
     def train(self, dataloader):
         self.model.to(self.config.device)
