@@ -11,11 +11,11 @@ class SlitAugment:
 
     def __init__(self) -> None:
         self.crop_specs = (
-            ("left", 0, 0.4),
-            ("center_left", 66, 0.2),
+            ("left", 0, -0.4),
+            ("center_left", 66, -0.2),
             ("center", 112, 0.0),
-            ("center_right", 178, -0.2),
-            ("right", 224, -0.4),
+            ("center_right", 178, 0.2),
+            ("right", 224, 0.4),
         )
 
     def get_augmented(self, image: np.ndarray, angular_z: float, augment_idx: int) -> Tuple[np.ndarray, float]:
