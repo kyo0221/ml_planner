@@ -4,13 +4,15 @@ from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, UInt8
 import torch
 
 from ml_planner.zed_api_utils import ZED_API_Utils
 
 
 class PlannerNode(Node):
+    NUM_BRANCHES = 4
+
     def __init__(self):
         super().__init__('planner_node')
         self.init_ros_parameter()
@@ -18,8 +20,10 @@ class PlannerNode(Node):
         self.zed = ZED_API_Utils()
 
         self.autonomous_flag = False
+        self.command = 0
 
         self.create_subscription(Bool, '/autonomous', self.autonomous_callback, qos_profile_system_default)
+        self.create_subscription(UInt8, '/command', self.command_callback, qos_profile_system_default)
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile_system_default)
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
 
@@ -44,15 +48,19 @@ class PlannerNode(Node):
     def autonomous_callback(self, msg):
         self.autonomous_flag = msg.data
 
+    def command_callback(self, msg):
+        self.command = int(msg.data)
+
     def timer_callback(self):
         if not self.autonomous_flag or not self.zed.grab():
             return
 
         image = self.zed.get_image()
         image_tensor = self.preprocess_image(image)
+        command_tensor = self.preprocess_command()
 
         with torch.no_grad():
-            output = self.model(image_tensor)
+            output = self.model(image_tensor, command_tensor)
 
         self.publisher_vel(output)
 
@@ -61,6 +69,11 @@ class PlannerNode(Node):
         image = image[:, 112:400, :]   # 400 - 112 = 288
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
         return image_tensor.to(self.device, dtype=torch.float32)
+
+    def preprocess_command(self):
+        command_tensor = torch.zeros((1, self.NUM_BRANCHES), device=self.device, dtype=torch.float32)
+        command_tensor[0, self.command] = 1.0
+        return command_tensor
     
     def publisher_vel(self, output):
         twist = Twist()
