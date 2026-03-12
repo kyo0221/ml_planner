@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import csv
+import yaml
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
-import yaml
+from tqdm import tqdm
 
 from network import Network
 from utils.slit_augment import SlitAugment
@@ -78,7 +79,7 @@ class Trainer:
             self.model.train()
             total_loss = 0.0
 
-            for image, action in dataloader:
+            for image, action in tqdm(dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs}'):
                 image = image.to(self.config.device)
                 action = action.to(self.config.device)
 
