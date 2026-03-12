@@ -17,10 +17,13 @@ from utils.slit_augment import SlitAugment
 
 
 class MLDataset(Dataset):
+    NUM_BRANCHES = 4
+
     def __init__(self, dataset_path: str):
         dataset_root = Path(dataset_path)
         self.image_dir = dataset_root / 'images'
         self.action_dir = dataset_root / 'actions'
+        self.command_dir = dataset_root / 'commands'
         self.image_paths = sorted(self.image_dir.glob('*.png'))
         self.augmentor = SlitAugment()
 
@@ -31,19 +34,28 @@ class MLDataset(Dataset):
         image_idx = idx // len(self.augmentor)
         augment_idx = idx % len(self.augmentor)
         img_file = self.image_paths[image_idx]
-        csv_file = self.action_dir / f'{img_file.stem}.csv'
+        action_file = self.action_dir / f'{img_file.stem}.csv'
+        command_file = self.command_dir / f'{img_file.stem}.csv'
 
         image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
-        with open(csv_file, 'r', newline='') as f:
+        with open(action_file, 'r', newline='') as f:
             angular_z = float(next(csv.reader(f))[1])
+
+        with open(command_file, 'r', newline='') as f:
+            command = float(next(csv.reader(f))[0])
 
         image, angular_z = self.augmentor.get_augmented(image, angular_z, augment_idx)
 
         image = image.astype(np.float32) / 255.0
         image = np.transpose(image, (2, 0, 1))
         image_tensor = torch.from_numpy(image)
+
         action_tensor = torch.tensor([angular_z], dtype=torch.float32)
-        return image_tensor, action_tensor
+
+        command_tensor = torch.zeros(self.NUM_BRANCHES, dtype=torch.float32)
+        command_tensor[int(command)] = 1.0
+        
+        return image_tensor, action_tensor, command_tensor
     
     
 class Config:
@@ -79,12 +91,13 @@ class Trainer:
             self.model.train()
             total_loss = 0.0
 
-            for image, action in tqdm(dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs}'):
+            for image, action, command in tqdm(dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs}'):
                 image = image.to(self.config.device)
                 action = action.to(self.config.device)
+                command = command.to(self.config.device)
 
                 self.optimizer.zero_grad()
-                outputs = self.model(image)
+                outputs = self.model(image, command)
                 loss = self.loss(outputs, action)
                 loss.backward()
                 self.optimizer.step()
