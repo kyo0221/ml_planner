@@ -7,7 +7,7 @@ class Network(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.backbone = timm.create_model("efficientnetv2_s", pretrained=True, num_classes=0)
+        self.backbone = timm.create_model("efficientnetv2_s", pretrained=False, num_classes=0)
 
         self.mlp = nn.Sequential(
             nn.Linear(self.backbone.num_features, 256),
