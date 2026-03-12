@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from network import Network
@@ -83,6 +84,7 @@ class Trainer:
         self.model = Network()
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
         self.loss = nn.MSELoss()
+        self.writer = SummaryWriter(self.logs_dir)
         
     def train(self, dataloader):
         self.model.to(self.config.device)
@@ -105,7 +107,10 @@ class Trainer:
                 total_loss += loss.item()
 
             avg_loss = total_loss / len(dataloader)
+            self.writer.add_scalar("loss", avg_loss, epoch)
             print(f'Epoch [{epoch+1}/{self.config.epochs}], Loss: {avg_loss:.4f}')
+
+        self.writer.close()
 
 def main():
     if len(sys.argv) != 2:
