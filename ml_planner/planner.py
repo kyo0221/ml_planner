@@ -1,13 +1,15 @@
 from pathlib import Path
 
+import cv2
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
-from std_msgs.msg import Bool, UInt8
+from std_msgs.msg import Bool
 import torch
 
 from ml_planner.zed_api_utils import ZED_API_Utils
+from ml_planner.placenav.place_recognition import PlaceRecognition
 
 
 class PlannerNode(Node):
@@ -18,28 +20,47 @@ class PlannerNode(Node):
         self.init_ros_parameter()
         self.init_torch_model()
         self.zed = ZED_API_Utils()
+        self.placenav = PlaceRecognition(
+            self.placenav_weight_path,
+            self.topomap_path,
+            device=self.device,
+            delta=self.placenet_delta,
+            window_lower=self.placenet_window_lower,
+            window_upper=self.placenet_window_upper,
+        )
 
         self.autonomous_flag = False
         self.command = 0
 
         self.create_subscription(Bool, '/autonomous', self.autonomous_callback, qos_profile_system_default)
-        self.create_subscription(UInt8, '/command', self.command_callback, qos_profile_system_default)
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile_system_default)
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
 
     def init_ros_parameter(self):
-        self.declare_parameter('linear_vel', 1.0)
+        self.declare_parameter('linear_max.vel', 1.0)
         self.declare_parameter('model_name', 'model.pt')
+        self.declare_parameter('placenet_model_name', 'placenet.pt')
+        self.declare_parameter('topomap_name', 'topomap.yaml')
+        self.declare_parameter('placenet_delta', 5.0)
+        self.declare_parameter('placenet_window_lower', -2)
+        self.declare_parameter('placenet_window_upper', 10)
         self.declare_parameter('interval_ms', 100)
 
-        self.linear_vel = float(self.get_parameter('linear_vel').value)
+        self.linear_vel = float(self.get_parameter('linear_max.vel').value)
         self.model_path = self.get_parameter('model_name').value
+        self.placenet_model_name = self.get_parameter('placenet_model_name').value
+        self.topomap_name = self.get_parameter('topomap_name').value
+        self.placenet_delta = float(self.get_parameter('placenet_delta').value)
+        self.placenet_window_lower = int(self.get_parameter('placenet_window_lower').value)
+        self.placenet_window_upper = int(self.get_parameter('placenet_window_upper').value)
         self.interval_ms = int(self.get_parameter('interval_ms').value)
 
     def init_torch_model(self):
         planner_dir = Path(__file__).parent
         package_root = planner_dir.parent
         weight_path = package_root / 'weights' / self.model_path
+        self.placenav_weight_path = package_root / 'weights' / self.placenet_model_name
+        self.topomap_path = package_root / 'config' / self.topomap_name
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = torch.jit.load(weight_path, map_location=self.device)
@@ -48,16 +69,16 @@ class PlannerNode(Node):
     def autonomous_callback(self, msg):
         self.autonomous_flag = msg.data
 
-    def command_callback(self, msg):
-        self.command = int(msg.data)
-
     def timer_callback(self):
         if not self.autonomous_flag or not self.zed.grab():
             return
 
         image = self.zed.get_image()
         image_tensor = self.preprocess_image(image)
-        command_tensor = self.preprocess_command()
+        placenet_image_tensor = self.preprocess_placenet_image(image)
+
+        command = self.placenav.get_recognition(placenet_image_tensor)
+        command_tensor = self.preprocess_command(command)
 
         with torch.no_grad():
             output = self.model(image_tensor, command_tensor)
@@ -70,9 +91,17 @@ class PlannerNode(Node):
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
         return image_tensor.to(self.device, dtype=torch.float32)
 
-    def preprocess_command(self):
+    def preprocess_placenet_image(self, image):
+        image = image[..., :3]
+        image = image[:, 112:400, :]
+        placenet_image = cv2.resize(image, (85, 85), interpolation=cv2.INTER_AREA)
+        placenet_image_tensor = torch.from_numpy(placenet_image).permute(2, 0, 1).unsqueeze(0).contiguous()
+        return placenet_image_tensor.to(self.device, dtype=torch.float32)
+
+    def preprocess_command(self, command=None):
         command_tensor = torch.zeros((1, self.NUM_BRANCHES), device=self.device, dtype=torch.float32)
-        command_tensor[0, self.command] = 1.0
+        command_idx = self.command if command is None else int(command)
+        command_tensor[0, command_idx] = 1.0
         return command_tensor
     
     def publisher_vel(self, output):
