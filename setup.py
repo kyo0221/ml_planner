@@ -1,5 +1,5 @@
-from setuptools import find_packages, setup
 from glob import glob
+from setuptools import find_packages, setup
 
 package_name = 'ml_planner'
 
@@ -14,7 +14,10 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         ('share/' + package_name + '/config', glob('config/*.yaml')),
     ],
-    install_requires=['setuptools'],
+    install_requires=[
+        'setuptools',
+        'diffusers',
+    ],
     zip_safe=True,
     maintainer='kyo',
     maintainer_email='s21c1135sc@s.chibakoudai.jp',
