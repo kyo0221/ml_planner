@@ -113,7 +113,7 @@ class Trainer:
             
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                torch.save(self.model.state_dict(), self.config.weights_dir / self.config.weight_file)
+                torch.jit.script(self.model).save(self.config.weights_dir / self.config.weight_file)
 
         self.writer.close()
 
