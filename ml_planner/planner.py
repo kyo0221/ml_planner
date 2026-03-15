@@ -80,7 +80,7 @@ class PlannerNode(Node):
         image = image[..., :3]
         image = image[:, 112:400, :]   # 400 - 112 = 288
         image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
-        return image_tensor.to(self.device, dtype=torch.float32)
+        return image_tensor.to(self.device, dtype=torch.float32) / 255.0
 
     def preprocess_placenet_image(self, image):
         image = image[..., :3]
