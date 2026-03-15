@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from ml_planner.placenav.topomap import load_topomap
@@ -27,61 +28,64 @@ class PlaceRecognition:
         topomap = load_topomap(topomap_path, self.device)
         self.node_ids = topomap['node_ids']
         self.actions = topomap['actions']
-        self.feature_matrix = topomap['feature_matrix']
+        self.descriptors = topomap['feature_matrix']
 
         self.delta = float(delta)
         self.window_lower = int(window_lower)
         self.window_upper = int(window_upper)
-        self.lambda1 = None
+        self.window_size = int((self.window_upper - self.window_lower) / 2)
+        self.transition = np.ones(self.window_upper - self.window_lower, dtype=np.float32)
+        self.lambda1 = 0.0
         self.belief = None
-        self.transition_matrix = self._build_transition_matrix(len(self.node_ids))
 
-    def _build_transition_matrix(self, num_nodes):
-        transition = torch.zeros((num_nodes, num_nodes), device=self.device, dtype=torch.float32)
-        for src in range(num_nodes):
-            lower = max(0, src + self.window_lower)
-            upper = min(num_nodes, src + self.window_upper)
-            if upper <= lower:
-                transition[src, src] = 1.0
-                continue
-            transition[src, lower:upper] = 1.0
+    def _compute_distances(self, query_feature):
+        dots = np.dot(self.descriptors, query_feature)
+        return np.sqrt(2 - 2 * dots)
 
-        row_sums = transition.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return transition / row_sums
+    def _initialize_belief(self, query_feature):
+        dists = self._compute_distances(query_feature)
+        descriptor_quantiles = np.quantile(dists, [0.025, 0.975])
+        self.lambda1 = np.log(self.delta) / (descriptor_quantiles[1] - descriptor_quantiles[0])
+        self.belief = np.exp(-self.lambda1 * dists)
+        self.belief /= self.belief.sum()
 
-    def _compute_scores(self, query_feature):
-        return self.feature_matrix @ query_feature
+    def _observation_likelihood(self, query_feature):
+        return np.exp(-self.lambda1 * self._compute_distances(query_feature))
 
-    def _initialize_belief(self, scores):
-        score_quantiles = torch.quantile(scores, torch.tensor([0.025, 0.975], device=self.device))
-        score_span = (score_quantiles[1] - score_quantiles[0]).clamp_min(1e-6)
-        self.lambda1 = torch.log(torch.tensor(self.delta, device=self.device)) / score_span
+    def _update_belief(self, query_feature):
+        if self.window_lower < 0:
+            conv_ind_l = abs(self.window_lower)
+            conv_ind_h = len(self.belief) + abs(self.window_lower)
+            bel_ind_l, bel_ind_h = 0, len(self.belief)
+        else:
+            conv_ind_l, conv_ind_h = 0, len(self.belief) - self.window_lower
+            bel_ind_l, bel_ind_h = self.window_lower, len(self.belief)
 
-        belief = torch.exp(self.lambda1 * (scores - score_quantiles[1]))
-        self.belief = belief / belief.sum().clamp_min(1e-12)
+        belief_pad = np.pad(self.belief, len(self.transition) - 1, mode='symmetric')
+        conv = np.convolve(belief_pad, self.transition, mode='valid')
+        self.belief[bel_ind_l:bel_ind_h] = conv[conv_ind_l:conv_ind_h]
 
-    def _update_belief(self, scores):
-        obs_likelihood = torch.exp(self.lambda1 * scores)
-        self.belief = self.transition_matrix.transpose(0, 1) @ self.belief
-        self.belief = self.belief * obs_likelihood
-        self.belief = self.belief / self.belief.sum().clamp_min(1e-12)
+        if self.window_lower > 0:
+            self.belief[:self.window_lower] = 0.0
+
+        self.belief *= self._observation_likelihood(query_feature)
+        self.belief /= self.belief.sum()
 
     def get_recognition(self, image_tensor):
         image_tensor = image_tensor.to(self.device, dtype=torch.float32)
         with torch.no_grad():
             output = self.model(image_tensor)
 
-        query_feature = output.squeeze(0).flatten()
-        scores = self._compute_scores(query_feature)
+        query_feature = output.squeeze(0).cpu().numpy().squeeze()
 
         if self.belief is None:
-            self._initialize_belief(scores)
+            self._initialize_belief(query_feature)
         else:
-            self._update_belief(scores)
+            self._update_belief(query_feature)
 
-        best_idx = int(torch.argmax(self.belief).item())
+        best_idx = int(np.argmax(self.belief))
         action = self.actions[best_idx]
         if action not in self.ACTION_TO_COMMAND:
             raise ValueError(f'Unsupported action in topomap: {action}')
 
-        return self.ACTION_TO_COMMAND[action]
+        return self.ACTION_TO_COMMAND[action], best_idx

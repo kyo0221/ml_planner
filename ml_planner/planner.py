@@ -2,18 +2,22 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 import cv2
+from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 import torch
+from torchvision import transforms
 
 from ml_planner.zed_api_utils import ZED_API_Utils
 from ml_planner.placenav.place_recognition import PlaceRecognition
 
 
 class PlannerNode(Node):
+    COMMAND_LABELS = ['roadside', 'straight', 'left', 'right']
     NUM_BRANCHES = 4
 
     def __init__(self):
@@ -30,11 +34,18 @@ class PlannerNode(Node):
             window_upper=self.placenet_window_upper,
         )
 
-        self.autonomous_flag = True
+        self.autonomous_flag = False
         self.command = 0
+        self.cv_bridge = CvBridge()
+        self.placenet_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((85, 85), antialias=True),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
         self.create_subscription(Bool, '/autonomous', self.autonomous_callback, qos_profile_system_default)
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile_system_default)
+        self.debug_image_pub = self.create_publisher(Image, '/ml_planner/place_recognition_debug', qos_profile_system_default)
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
 
     def init_ros_parameter(self):
@@ -68,7 +79,9 @@ class PlannerNode(Node):
         image_tensor = self.preprocess_image(image)
         placenet_image_tensor = self.preprocess_placenet_image(image)
 
-        command = self.placenav.get_recognition(placenet_image_tensor)
+        command, idx = self.placenav.get_recognition(placenet_image_tensor)
+        self.get_logger().info(f'place recognition: command={command}, idx={idx}')
+        self.publish_place_recognition_debug_image(image, command)
         command_tensor = self.preprocess_command(command)
 
         with torch.no_grad():
@@ -84,10 +97,21 @@ class PlannerNode(Node):
 
     def preprocess_placenet_image(self, image):
         image = image[..., :3]
-        image = image[:, 112:400, :]
-        placenet_image = cv2.resize(image, (85, 85), interpolation=cv2.INTER_AREA)
-        placenet_image_tensor = torch.from_numpy(placenet_image).permute(2, 0, 1).unsqueeze(0).contiguous()
+        image = cv2.cvtColor(image[:, 112:400, :], cv2.COLOR_BGR2RGB)
+        placenet_image_tensor = self.placenet_transform(image).unsqueeze(0)
         return placenet_image_tensor.to(self.device, dtype=torch.float32)
+
+    def publish_place_recognition_debug_image(self, image, command):
+        image = image[..., :3]
+        image = cv2.resize(image[:, 112:400, :], (340, 340), interpolation=cv2.INTER_NEAREST)
+        cv2.rectangle(image, (0, 260), (340, 340), (30, 30, 30), -1)
+        for idx, label in enumerate(self.COMMAND_LABELS):
+            x = 10 + idx * 82
+            color = (0, 255, 0) if idx == int(command) else (100, 100, 100)
+            cv2.rectangle(image, (x, 275), (x + 72, 325), color, -1)
+            cv2.rectangle(image, (x, 275), (x + 72, 325), (255, 255, 255), 2)
+            cv2.putText(image, label, (x + 4, 305), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        self.debug_image_pub.publish(self.cv_bridge.cv2_to_imgmsg(image, encoding='bgr8'))
 
     def preprocess_command(self, command=None):
         command_tensor = torch.zeros((1, self.NUM_BRANCHES), device=self.device, dtype=torch.float32)
