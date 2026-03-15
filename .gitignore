@@ -7,5 +7,6 @@ __pycache__
 /install
 /log
 
-/run
+/runs
 /data
+/config/topomap*

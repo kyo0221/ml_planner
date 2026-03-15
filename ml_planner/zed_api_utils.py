@@ -30,4 +30,4 @@ class ZED_API_Utils:
         self.zed.retrieve_image(self.image, sl.VIEW.RIGHT, sl.MEM.CPU, sl.Resolution(512, 288)) # 最終的に288x288の画像を想定
         img = self.image.get_data()
 
-        return img
+        return img.copy()

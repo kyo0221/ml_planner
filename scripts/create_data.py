@@ -15,7 +15,7 @@ import cv2
 from ml_planner.zed_api_utils import ZED_API_Utils
 
 
-SAMPLE_INTERVAL = 0.1
+SAMPLE_INTERVAL = 0.2
 
 
 class DataCreator(Node):
