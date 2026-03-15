@@ -1,121 +1,284 @@
 #!/usr/bin/env python3
 
 import csv
-import yaml
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
-import numpy as np
 import torch
-import torch.nn as nn
+import yaml
+from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from network import Network
-from utils.slit_augment import SlitAugment
+from ml_planner.image_utils import preprocess_policy_image
+from ml_planner.models import ActionNormalizer, DiffusionPolicy
 
 
-class MLDataset(Dataset):
-    NUM_BRANCHES = 4
+def load_scalar_csv(path: Path) -> float:
+    with path.open('r', newline='') as f:
+        return float(next(csv.reader(f))[0])
 
-    def __init__(self, dataset_path: str):
-        dataset_root = Path(dataset_path)
-        self.image_dir = dataset_root / 'images'
-        self.action_dir = dataset_root / 'actions'
-        self.command_dir = dataset_root / 'commands'
-        self.image_paths = sorted(self.image_dir.glob('*.png'))
-        self.augmentor = SlitAugment()
 
-    def __len__(self):
-        return len(self.image_paths) * len(self.augmentor)
+def load_action_csv(path: Path) -> float:
+    with path.open('r', newline='') as f:
+        return float(next(csv.reader(f))[1])
 
-    def __getitem__(self, idx):
-        image_idx = idx // len(self.augmentor)
-        augment_idx = idx % len(self.augmentor)
-        img_file = self.image_paths[image_idx]
-        action_file = self.action_dir / f'{img_file.stem}.csv'
-        command_file = self.command_dir / f'{img_file.stem}.csv'
 
-        image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
-        with open(action_file, 'r', newline='') as f:
-            angular_z = float(next(csv.reader(f))[1])
-
-        with open(command_file, 'r', newline='') as f:
-            command = float(next(csv.reader(f))[0])
-
-        image, angular_z = self.augmentor.get_augmented(image, angular_z, augment_idx)
-
-        image = image.astype(np.float32) / 255.0
-        image = np.transpose(image, (2, 0, 1))
-        image_tensor = torch.from_numpy(image)
-
-        action_tensor = torch.tensor([angular_z], dtype=torch.float32)
-
-        command_tensor = torch.zeros(self.NUM_BRANCHES, dtype=torch.float32)
-        command_tensor[int(command)] = 1.0
-        
-        return image_tensor, action_tensor, command_tensor
-    
-    
+@dataclass
 class Config:
-    def __init__(self, config_path, package_root):
-        with open(config_path, 'r') as f:
+    epochs: int
+    batch_size: int
+    learning_rate: float
+    num_workers: int
+    weight_file: str
+    n_obs_steps: int
+    pred_horizon: int
+    action_dim: int
+    image_size: int
+    diffusion_step_embed_dim: int
+    global_cond_dim: int
+    down_dims: tuple[int, ...]
+    kernel_size: int
+    n_groups: int
+    num_train_timesteps: int
+    num_inference_steps: int
+    beta_schedule: str
+    prediction_type: str
+    clip_sample: bool
+    weights_dir: Path
+    logs_dir: Path
+    device: torch.device
+
+    @classmethod
+    def load(cls, config_path: Path, package_root: Path):
+        with config_path.open('r', encoding='utf-8') as f:
             config_dict = yaml.safe_load(f)
 
-        self.epochs = config_dict['epochs']
-        self.batch_size = config_dict['batch_size']
-        self.learning_rate = config_dict['learning_rate']
-        self.num_workers = config_dict['num_workers']
-        self.weight_file = config_dict['weight_file']
+        dataset_cfg = config_dict['dataset']
+        vision_cfg = config_dict['vision']
+        model_cfg = config_dict['model']
+        diffusion_cfg = config_dict['diffusion']
 
-        self.weights_dir = package_root / 'weights'
-        self.logs_dir = package_root / 'runs'
-        self.weights_dir.mkdir(exist_ok=True)
-        self.logs_dir.mkdir(exist_ok=True)
+        weights_dir = package_root / 'weights'
+        logs_dir = package_root / 'runs'
+        weights_dir.mkdir(exist_ok=True)
+        logs_dir.mkdir(exist_ok=True)
 
-        self.device = torch.device('cuda')
+        return cls(
+            epochs=int(config_dict['epochs']),
+            batch_size=int(config_dict['batch_size']),
+            learning_rate=float(config_dict['learning_rate']),
+            num_workers=int(config_dict['num_workers']),
+            weight_file=str(config_dict['weight_file']),
+            n_obs_steps=int(dataset_cfg['n_obs_steps']),
+            pred_horizon=int(dataset_cfg['pred_horizon']),
+            action_dim=int(dataset_cfg['action_dim']),
+            image_size=int(vision_cfg['image_size']),
+            diffusion_step_embed_dim=int(model_cfg['diffusion_step_embed_dim']),
+            global_cond_dim=int(model_cfg['global_cond_dim']),
+            down_dims=tuple(model_cfg['down_dims']),
+            kernel_size=int(model_cfg['kernel_size']),
+            n_groups=int(model_cfg['n_groups']),
+            num_train_timesteps=int(diffusion_cfg['num_train_timesteps']),
+            num_inference_steps=int(diffusion_cfg['num_inference_steps']),
+            beta_schedule=str(diffusion_cfg['beta_schedule']),
+            prediction_type=str(diffusion_cfg['prediction_type']),
+            clip_sample=bool(diffusion_cfg['clip_sample']),
+            weights_dir=weights_dir,
+            logs_dir=logs_dir,
+            device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        )
 
 
-class Trainer:
-    def __init__(self, config):
-        self.config = config
-        self.model = Network()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
-        self.loss = nn.MSELoss()
-        self.writer = SummaryWriter(config.logs_dir)
-        
-    def train(self, dataloader):
-        self.model.to(self.config.device)
-        best_loss = float('inf')
+class EpisodeSequenceDataset(Dataset):
+    NUM_COMMANDS = 4
 
-        for epoch in range(self.config.epochs):
-            self.model.train()
-            total_loss = 0.0
+    def __init__(self, dataset_path: Path, n_obs_steps: int, pred_horizon: int, image_size: int):
+        self.dataset_path = dataset_path
+        self.n_obs_steps = n_obs_steps
+        self.pred_horizon = pred_horizon
+        self.image_size = image_size
+        self.samples = []
+        self._build_index()
 
-            for image, action, command in tqdm(dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs}'):
-                image = image.to(self.config.device)
-                action = action.to(self.config.device)
-                command = command.to(self.config.device)
+    def _build_index(self) -> None:
+        episode_dirs = sorted(path for path in self.dataset_path.glob('episode_*') if path.is_dir())
+        if not episode_dirs:
+            raise ValueError(f'No episode directories found in {self.dataset_path}')
 
-                self.optimizer.zero_grad()
-                outputs = self.model(image, command)
-                loss = self.loss(outputs, action)
-                loss.backward()
-                self.optimizer.step()
+        for episode_dir in episode_dirs:
+            image_paths = sorted((episode_dir / 'images').glob('*.png'))
+            if not image_paths:
+                continue
 
-                total_loss += loss.item()
+            num_frames = len(image_paths)
+            max_start = num_frames - self.pred_horizon + 1
+            for current_idx in range(self.n_obs_steps - 1, max_start):
+                self.samples.append((episode_dir, current_idx))
 
-            avg_loss = total_loss / len(dataloader)
-            self.writer.add_scalar("loss", avg_loss, epoch)
-            print(f'Epoch [{epoch+1}/{self.config.epochs}], Loss: {avg_loss:.4f}')
-            
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                torch.jit.script(self.model).save(self.config.weights_dir / self.config.weight_file)
+        if not self.samples:
+            raise ValueError(f'No valid training windows found in {self.dataset_path}')
 
-        self.writer.close()
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def _load_image(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
+        image_path = episode_dir / 'images' / f'{frame_idx + 1:05d}.png'
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f'Failed to read image: {image_path}')
+        return preprocess_policy_image(image, self.image_size)
+
+    def _load_command(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
+        command_path = episode_dir / 'commands' / f'{frame_idx + 1:05d}.csv'
+        command_idx = int(load_scalar_csv(command_path))
+        command = torch.zeros(self.NUM_COMMANDS, dtype=torch.float32)
+        command[command_idx] = 1.0
+        return command
+
+    def _load_actions(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
+        actions = []
+        for offset in range(self.pred_horizon):
+            action_path = episode_dir / 'actions' / f'{frame_idx + offset + 1:05d}.csv'
+            actions.append([load_action_csv(action_path)])
+        return torch.tensor(actions, dtype=torch.float32)
+
+    def __getitem__(self, idx: int):
+        episode_dir, current_idx = self.samples[idx]
+        obs_images = []
+        for frame_idx in range(current_idx - self.n_obs_steps + 1, current_idx + 1):
+            obs_images.append(self._load_image(episode_dir, frame_idx))
+
+        return (
+            torch.stack(obs_images, dim=0),
+            self._load_command(episode_dir, current_idx),
+            self._load_actions(episode_dir, current_idx),
+        )
+
+
+def build_noise_scheduler(config: Config) -> DDPMScheduler:
+    return DDPMScheduler(
+        num_train_timesteps=config.num_train_timesteps,
+        beta_schedule=config.beta_schedule,
+        prediction_type=config.prediction_type,
+        clip_sample=config.clip_sample,
+    )
+
+
+def build_model(config: Config) -> DiffusionPolicy:
+    return DiffusionPolicy(
+        action_dim=config.action_dim,
+        pred_horizon=config.pred_horizon,
+        n_obs_steps=config.n_obs_steps,
+        diffusion_step_embed_dim=config.diffusion_step_embed_dim,
+        global_cond_dim=config.global_cond_dim,
+        down_dims=config.down_dims,
+        kernel_size=config.kernel_size,
+        n_groups=config.n_groups,
+    )
+
+
+def fit_normalizer(dataloader: DataLoader) -> ActionNormalizer:
+    actions = []
+    for _, _, batch_actions in dataloader:
+        actions.append(batch_actions)
+    stacked_actions = torch.cat(actions, dim=0)
+    normalizer = ActionNormalizer()
+    normalizer.fit(stacked_actions)
+    return normalizer
+
+
+def save_checkpoint(
+    config: Config,
+    model: DiffusionPolicy,
+    optimizer: torch.optim.Optimizer,
+    normalizer: ActionNormalizer,
+    scheduler: DDPMScheduler,
+    epoch: int,
+    loss: float,
+) -> None:
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'normalizer': normalizer.state_dict(),
+        'model_config': {
+            'action_dim': config.action_dim,
+            'pred_horizon': config.pred_horizon,
+            'n_obs_steps': config.n_obs_steps,
+            'diffusion_step_embed_dim': config.diffusion_step_embed_dim,
+            'global_cond_dim': config.global_cond_dim,
+            'down_dims': list(config.down_dims),
+            'kernel_size': config.kernel_size,
+            'n_groups': config.n_groups,
+        },
+        'scheduler_config': dict(scheduler.config),
+        'train_config': {
+            'num_inference_steps': config.num_inference_steps,
+            'image_size': config.image_size,
+        },
+        'epoch': epoch,
+        'loss': loss,
+    }
+    torch.save(checkpoint, config.weights_dir / config.weight_file)
+
+
+def train(dataset_path: Path) -> None:
+    script_dir = Path(__file__).parent
+    package_root = script_dir.parent
+    config = Config.load(package_root / 'config' / 'train.yaml', package_root)
+
+    dataset = EpisodeSequenceDataset(
+        dataset_path=dataset_path,
+        n_obs_steps=config.n_obs_steps,
+        pred_horizon=config.pred_horizon,
+        image_size=config.image_size,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+    normalizer = fit_normalizer(DataLoader(dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers))
+    noise_scheduler = build_noise_scheduler(config)
+    model = build_model(config).to(config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    writer = SummaryWriter(config.logs_dir)
+
+    best_loss = float('inf')
+    for epoch in range(config.epochs):
+        model.train()
+        total_loss = 0.0
+
+        progress = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{config.epochs}')
+        for obs_images, command, actions in progress:
+            obs_images = obs_images.to(config.device, dtype=torch.float32)
+            command = command.to(config.device, dtype=torch.float32)
+            actions = normalizer.normalize(actions.to(config.device, dtype=torch.float32))
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = model.compute_loss(obs_images, command, actions, noise_scheduler)
+            loss.backward()
+            optimizer.step()
+
+            loss_value = loss.item()
+            total_loss += loss_value
+            progress.set_postfix(loss=f'{loss_value:.4f}')
+
+        avg_loss = total_loss / len(dataloader)
+        writer.add_scalar('loss/train', avg_loss, epoch)
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_checkpoint(config, model, optimizer, normalizer, noise_scheduler, epoch, avg_loss)
+
+    writer.close()
+
 
 def main():
     if len(sys.argv) != 2:
@@ -127,15 +290,8 @@ def main():
         print(f'Dataset path does not exist: {dataset_path}')
         sys.exit(1)
 
-    script_dir = Path(__file__).parent
-    package_root = script_dir.parent
-    config_path = package_root / 'config' /'train.yaml'
-    config = Config(config_path, package_root)
+    train(dataset_path)
 
-    dataset = MLDataset(str(dataset_path))
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
-    trainer = Trainer(config)
-    trainer.train(dataloader)
 
 if __name__ == '__main__':
     main()
