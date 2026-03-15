@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 import torch
 import yaml
+from torchvision import transforms
 
 
 class TopomapGenerator:
@@ -33,6 +34,11 @@ class TopomapGenerator:
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = self.load_model()
+        self.placenet_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Resize((self.OUTPUT_SIZE, self.OUTPUT_SIZE), antialias=True),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
 
     def load_model(self):
         weight_path = self.package_root / 'weights' / 'placenet.pt'
@@ -71,7 +77,7 @@ class TopomapGenerator:
         return resized_image
 
     def extract_feature(self, image):
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
+        image_tensor = self.placenet_transform(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).unsqueeze(0)
         image_tensor = image_tensor.to(self.device, dtype=torch.float32)
 
         with torch.no_grad():
