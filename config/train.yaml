@@ -1,5 +1,27 @@
-epochs: 200
-batch_size: 16
-learning_rate: 0.0002
+epochs: 300
+batch_size: 32
+learning_rate: 0.0001
 num_workers: 8
-weight_file: "hoge.pt"
+weight_file: "diffusion_policy.pt"
+
+dataset:
+  n_obs_steps: 2
+  pred_horizon: 8
+  action_dim: 1
+
+vision:
+  image_size: 224
+
+model:
+  diffusion_step_embed_dim: 256
+  global_cond_dim: 512
+  down_dims: [64, 128, 256]
+  kernel_size: 5
+  n_groups: 8
+
+diffusion:
+  num_train_timesteps: 100
+  num_inference_steps: 10
+  beta_schedule: "squaredcos_cap_v2"
+  prediction_type: "epsilon"
+  clip_sample: true
