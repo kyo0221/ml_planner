@@ -1,6 +1,6 @@
 from pathlib import Path
 
-import torch
+import numpy as np
 import yaml
 
 
@@ -18,8 +18,8 @@ def load_topomap(topomap_path, device):
     features = []
 
     for node in nodes:
-        feature = torch.tensor(node['feature'], device=device, dtype=torch.float32)
-        if feature.numel() != 512:
+        feature = np.asarray(node['feature'], dtype=np.float32)
+        if feature.size != 512:
             raise ValueError(f'Feature dimension must be 512: node_id={node.get("id")}')
 
         edges = node.get('edges', [])
@@ -30,7 +30,7 @@ def load_topomap(topomap_path, device):
         actions.append(edges[0]['action'])
         features.append(feature)
 
-    feature_matrix = torch.stack(features, dim=0)
+    feature_matrix = np.stack(features, axis=0)
     return {
         'node_ids': node_ids,
         'actions': actions,
