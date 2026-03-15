@@ -1,8 +1,10 @@
+from collections import deque
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 import cv2
 from cv_bridge import CvBridge
+from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from geometry_msgs.msg import Twist
 import rclpy
 from rclpy.node import Node
@@ -12,13 +14,14 @@ from std_msgs.msg import Bool
 import torch
 from torchvision import transforms
 
-from ml_planner.zed_api_utils import ZED_API_Utils
+from ml_planner.image_utils import preprocess_policy_image
+from ml_planner.models import ActionNormalizer, DiffusionPolicy
 from ml_planner.placenav.place_recognition import PlaceRecognition
+from ml_planner.zed_api_utils import ZED_API_Utils
 
 
 class PlannerNode(Node):
     COMMAND_LABELS = ['roadside', 'straight', 'left', 'right']
-    NUM_BRANCHES = 4
 
     def __init__(self):
         super().__init__('planner_node', allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
@@ -35,7 +38,7 @@ class PlannerNode(Node):
         )
 
         self.autonomous_flag = False
-        self.command = 0
+        self.obs_buffer = deque(maxlen=self.n_obs_steps)
         self.cv_bridge = CvBridge()
         self.placenet_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -57,16 +60,39 @@ class PlannerNode(Node):
         self.placenet_window_lower = int(self.get_parameter('placenet_window_lower').value)
         self.placenet_window_upper = int(self.get_parameter('placenet_window_upper').value)
         self.interval_ms = int(self.get_parameter('interval_ms').value)
+        self.num_inference_steps = int(self.get_parameter('num_inference_steps').value)
+        self.n_obs_steps = int(self.get_parameter('n_obs_steps').value)
+        self.pred_horizon = int(self.get_parameter('pred_horizon').value)
+        self.policy_image_size = int(self.get_parameter('policy_image_size').value)
 
     def init_torch_model(self):
         package_root = Path(get_package_share_directory('ml_planner')).parents[3] / 'src' / 'ml_planner'
-        weight_path = package_root / 'weights' / self.model_path
+        checkpoint_path = package_root / 'weights' / self.model_path
         self.placenav_weight_path = package_root / 'weights' / self.placenet_model_name
         self.topomap_path = package_root / 'config' / self.topomap_name / 'topomap.yaml'
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = torch.jit.load(weight_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+
+        model_config = checkpoint['model_config']
+        self.model = DiffusionPolicy(
+            action_dim=model_config['action_dim'],
+            pred_horizon=model_config['pred_horizon'],
+            n_obs_steps=model_config['n_obs_steps'],
+            diffusion_step_embed_dim=model_config['diffusion_step_embed_dim'],
+            global_cond_dim=model_config['global_cond_dim'],
+            down_dims=tuple(model_config['down_dims']),
+            kernel_size=model_config['kernel_size'],
+            n_groups=model_config['n_groups'],
+        )
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
         self.model.eval()
+
+        self.normalizer = ActionNormalizer()
+        self.normalizer.load_state_dict(checkpoint['normalizer'])
+
+        self.scheduler = DDIMScheduler.from_config(checkpoint['scheduler_config'])
 
     def autonomous_callback(self, msg):
         self.autonomous_flag = msg.data
@@ -76,24 +102,33 @@ class PlannerNode(Node):
             return
 
         image = self.zed.get_image()
-        image_tensor = self.preprocess_image(image)
+        policy_image = self.preprocess_policy_image(image)
         placenet_image_tensor = self.preprocess_placenet_image(image)
+
+        self.obs_buffer.append(policy_image)
+        while len(self.obs_buffer) < self.n_obs_steps:
+            self.obs_buffer.appendleft(policy_image.clone())
 
         command, idx = self.placenav.get_recognition(placenet_image_tensor)
         self.get_logger().info(f'place recognition: command={command}, idx={idx}')
         self.publish_place_recognition_debug_image(image, command)
+
+        obs_images = torch.stack(list(self.obs_buffer), dim=0).unsqueeze(0).to(self.device, dtype=torch.float32)
         command_tensor = self.preprocess_command(command)
 
         with torch.no_grad():
-            output = self.model(image_tensor, command_tensor)
+            normalized_actions = self.model.sample_actions(
+                obs_images=obs_images,
+                command=command_tensor,
+                noise_scheduler=self.scheduler,
+                num_inference_steps=self.num_inference_steps,
+            )
+            actions = self.normalizer.denormalize(normalized_actions)
 
-        self.publisher_vel(output)
+        self.publish_velocity(actions[0, 0, 0].item())
 
-    def preprocess_image(self, image):
-        image = image[..., :3]
-        image = image[:, 112:400, :]   # 400 - 112 = 288
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
-        return image_tensor.to(self.device, dtype=torch.float32) / 255.0
+    def preprocess_policy_image(self, image):
+        return preprocess_policy_image(image, self.policy_image_size)
 
     def preprocess_placenet_image(self, image):
         image = image[..., :3]
@@ -113,16 +148,15 @@ class PlannerNode(Node):
             cv2.putText(image, label, (x + 4, 305), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         self.debug_image_pub.publish(self.cv_bridge.cv2_to_imgmsg(image, encoding='bgr8'))
 
-    def preprocess_command(self, command=None):
-        command_tensor = torch.zeros((1, self.NUM_BRANCHES), device=self.device, dtype=torch.float32)
-        command_idx = self.command if command is None else int(command)
-        command_tensor[0, command_idx] = 1.0
+    def preprocess_command(self, command):
+        command_tensor = torch.zeros((1, len(self.COMMAND_LABELS)), device=self.device, dtype=torch.float32)
+        command_tensor[0, int(command)] = 1.0
         return command_tensor
-    
-    def publisher_vel(self, output):
+
+    def publish_velocity(self, angular_z: float):
         twist = Twist()
         twist.linear.x = self.linear_vel
-        twist.angular.z = float(output.squeeze().item())
+        twist.angular.z = float(angular_z)
         self.vel_pub.publish(twist)
 
 
