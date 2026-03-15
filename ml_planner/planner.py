@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from ament_index_python.packages import get_package_share_directory
 import cv2
 from geometry_msgs.msg import Twist
 import rclpy
@@ -16,7 +17,7 @@ class PlannerNode(Node):
     NUM_BRANCHES = 4
 
     def __init__(self):
-        super().__init__('planner_node')
+        super().__init__('planner_node', allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
         self.init_ros_parameter()
         self.init_torch_model()
         self.zed = ZED_API_Utils()
@@ -29,7 +30,7 @@ class PlannerNode(Node):
             window_upper=self.placenet_window_upper,
         )
 
-        self.autonomous_flag = False
+        self.autonomous_flag = True
         self.command = 0
 
         self.create_subscription(Bool, '/autonomous', self.autonomous_callback, qos_profile_system_default)
@@ -37,30 +38,20 @@ class PlannerNode(Node):
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
 
     def init_ros_parameter(self):
-        self.declare_parameter('linear_max.vel', 1.0)
-        self.declare_parameter('model_name', 'model.pt')
-        self.declare_parameter('placenet_model_name', 'placenet.pt')
-        self.declare_parameter('topomap_name', 'topomap.yaml')
-        self.declare_parameter('placenet_delta', 5.0)
-        self.declare_parameter('placenet_window_lower', -2)
-        self.declare_parameter('placenet_window_upper', 10)
-        self.declare_parameter('interval_ms', 100)
-
         self.linear_vel = float(self.get_parameter('linear_max.vel').value)
         self.model_path = self.get_parameter('model_name').value
         self.placenet_model_name = self.get_parameter('placenet_model_name').value
-        self.topomap_name = self.get_parameter('topomap_name').value
+        self.topomap_name = self.get_parameter('topomap_dir_name').value
         self.placenet_delta = float(self.get_parameter('placenet_delta').value)
         self.placenet_window_lower = int(self.get_parameter('placenet_window_lower').value)
         self.placenet_window_upper = int(self.get_parameter('placenet_window_upper').value)
         self.interval_ms = int(self.get_parameter('interval_ms').value)
 
     def init_torch_model(self):
-        planner_dir = Path(__file__).parent
-        package_root = planner_dir.parent
+        package_root = Path(get_package_share_directory('ml_planner')).parents[3] / 'src' / 'ml_planner'
         weight_path = package_root / 'weights' / self.model_path
         self.placenav_weight_path = package_root / 'weights' / self.placenet_model_name
-        self.topomap_path = package_root / 'config' / self.topomap_name
+        self.topomap_path = package_root / 'config' / self.topomap_name / 'topomap.yaml'
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = torch.jit.load(weight_path, map_location=self.device)

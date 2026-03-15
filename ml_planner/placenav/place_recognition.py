@@ -15,11 +15,12 @@ class PlaceRecognition:
         self,
         weight_path,
         topomap_path,
+        device,
         delta=5.0,
         window_lower=-2,
         window_upper=10,
     ):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = device
         self.model = torch.jit.load(weight_path, map_location=self.device)
         self.model.eval()
 
