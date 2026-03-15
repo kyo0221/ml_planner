@@ -9,6 +9,8 @@ import torch
 import yaml
 from torchvision import transforms
 
+from ml_planner.image_utils import center_crop_square
+
 
 class TopomapGenerator:
     COMMAND_TO_ACTION = {
@@ -17,14 +19,11 @@ class TopomapGenerator:
         2: 'left',
         3: 'right',
     }
-    CROP_SIZE = 288
     OUTPUT_SIZE = 85
     SAVED_STEP = 10
 
     def __init__(self, dataset_path):
         self.dataset_root = Path(dataset_path)
-        self.image_dir = self.dataset_root / 'images'
-        self.command_dir = self.dataset_root / 'commands'
 
         script_dir = Path(__file__).parent
         self.package_root = script_dir.parent
@@ -49,32 +48,24 @@ class TopomapGenerator:
     def _prepare_directories(self):
         self.topomap_images_dir.mkdir(parents=True, exist_ok=True)
 
-    def _load_command(self, image_path):
-        command_path = self.command_dir / f'{image_path.stem}.csv'
+    def _episode_dirs(self):
+        episode_dirs = sorted(path for path in self.dataset_root.glob('episode_*') if path.is_dir())
+        if not episode_dirs:
+            raise ValueError(f'No episode directories found in {self.dataset_root}')
+        return episode_dirs
+
+    def _load_command(self, episode_dir: Path, frame_name: str) -> int:
+        command_path = episode_dir / 'commands' / f'{frame_name}.csv'
         with command_path.open('r', newline='') as f:
             return int(float(next(csv.reader(f))[0]))
 
-    def _center_crop(self, image):
-        height, width = image.shape[:2]
-        if height < self.CROP_SIZE or width < self.CROP_SIZE:
-            raise ValueError(f'Image is smaller than {self.CROP_SIZE}x{self.CROP_SIZE}: {height}x{width}')
-
-        top = (height - self.CROP_SIZE) // 2
-        left = (width - self.CROP_SIZE) // 2
-        return image[top:top + self.CROP_SIZE, left:left + self.CROP_SIZE]
-
-    def _preprocess_image(self, image_path):
+    def _preprocess_image(self, image_path: Path):
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f'Failed to read image: {image_path}')
 
-        cropped_image = self._center_crop(image)
-        resized_image = cv2.resize(
-            cropped_image,
-            (self.OUTPUT_SIZE, self.OUTPUT_SIZE),
-            interpolation=cv2.INTER_AREA,
-        )
-        return resized_image
+        cropped_image = center_crop_square(image)
+        return cv2.resize(cropped_image, (self.OUTPUT_SIZE, self.OUTPUT_SIZE), interpolation=cv2.INTER_AREA)
 
     def extract_feature(self, image):
         image_tensor = self.placenet_transform(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)).unsqueeze(0)
@@ -86,28 +77,31 @@ class TopomapGenerator:
         return output.squeeze(0).flatten().tolist()
 
     def build_nodes(self):
-        image_paths = sorted(self.image_dir.glob('*.png'))
         nodes = []
+        global_index = 0
 
-        for idx, image_path in enumerate(image_paths[::self.SAVED_STEP]):
-            command = self._load_command(image_path)
-            if command not in self.COMMAND_TO_ACTION:
-                raise ValueError(f'Unsupported command value: {command}')
+        for episode_dir in self._episode_dirs():
+            image_paths = sorted((episode_dir / 'images').glob('*.png'))
+            for image_path in image_paths[::self.SAVED_STEP]:
+                command = self._load_command(episode_dir, image_path.stem)
+                if command not in self.COMMAND_TO_ACTION:
+                    raise ValueError(f'Unsupported command value: {command}')
 
-            processed_image = self._preprocess_image(image_path)
-            output_image_name = f'img{idx + 1:05d}.png'
-            output_image_path = self.topomap_images_dir / output_image_name
-            cv2.imwrite(str(output_image_path), processed_image)
+                processed_image = self._preprocess_image(image_path)
+                output_image_name = f'img{global_index + 1:05d}.png'
+                output_image_path = self.topomap_images_dir / output_image_name
+                cv2.imwrite(str(output_image_path), processed_image)
 
-            nodes.append({
-                'id': idx,
-                'image': output_image_name,
-                'feature': self.extract_feature(processed_image),
-                'action': self.COMMAND_TO_ACTION[command],
-            })
+                nodes.append({
+                    'id': global_index,
+                    'image': output_image_name,
+                    'feature': self.extract_feature(processed_image),
+                    'action': self.COMMAND_TO_ACTION[command],
+                })
+                global_index += 1
 
         if not nodes:
-            raise ValueError(f'No images found in dataset: {self.image_dir}')
+            raise ValueError(f'No images found in dataset: {self.dataset_root}')
 
         for idx, node in enumerate(nodes):
             target = idx + 1 if idx + 1 < len(nodes) else idx
@@ -133,8 +127,7 @@ def main():
         print(f'Dataset path does not exist: {dataset_path}')
         sys.exit(1)
 
-    topomap_generator = TopomapGenerator(dataset_path)
-    topomap_generator.generate()
+    TopomapGenerator(dataset_path).generate()
 
 
 if __name__ == '__main__':
