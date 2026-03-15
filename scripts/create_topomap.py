@@ -18,6 +18,7 @@ class TopomapGenerator:
     }
     CROP_SIZE = 288
     OUTPUT_SIZE = 85
+    SAVED_STEP = 10
 
     def __init__(self, dataset_path):
         self.dataset_root = Path(dataset_path)
@@ -82,7 +83,7 @@ class TopomapGenerator:
         image_paths = sorted(self.image_dir.glob('*.png'))
         nodes = []
 
-        for idx, image_path in enumerate(image_paths):
+        for idx, image_path in enumerate(image_paths[::self.SAVED_STEP]):
             command = self._load_command(image_path)
             if command not in self.COMMAND_TO_ACTION:
                 raise ValueError(f'Unsupported command value: {command}')
