@@ -13,8 +13,8 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from ml_planner.image_utils import preprocess_policy_image
 from ml_planner.models import ActionNormalizer, DiffusionPolicy
+from scripts.utils.recovery_augment import RecoveryAugment, RecoveryAugmentConfig
 
 
 def load_scalar_csv(path: Path) -> float:
@@ -48,6 +48,9 @@ class Config:
     beta_schedule: str
     prediction_type: str
     clip_sample: bool
+    augmentation_offsets: tuple[int, ...]
+    angular_correction_gain: float
+    horizon_decay: float
     weights_dir: Path
     logs_dir: Path
     device: torch.device
@@ -61,6 +64,7 @@ class Config:
         vision_cfg = config_dict['vision']
         model_cfg = config_dict['model']
         diffusion_cfg = config_dict['diffusion']
+        augmentation_cfg = config_dict['augmentation']
 
         weights_dir = package_root / 'weights'
         logs_dir = package_root / 'runs'
@@ -87,6 +91,9 @@ class Config:
             beta_schedule=str(diffusion_cfg['beta_schedule']),
             prediction_type=str(diffusion_cfg['prediction_type']),
             clip_sample=bool(diffusion_cfg['clip_sample']),
+            augmentation_offsets=tuple(int(value) for value in augmentation_cfg['lateral_pixel_offsets']),
+            angular_correction_gain=float(augmentation_cfg['angular_correction_gain']),
+            horizon_decay=float(augmentation_cfg['horizon_decay']),
             weights_dir=weights_dir,
             logs_dir=logs_dir,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
@@ -96,11 +103,12 @@ class Config:
 class EpisodeSequenceDataset(Dataset):
     NUM_COMMANDS = 4
 
-    def __init__(self, dataset_path: Path, n_obs_steps: int, pred_horizon: int, image_size: int):
+    def __init__(self, dataset_path: Path, n_obs_steps: int, pred_horizon: int, image_size: int, augmentor: RecoveryAugment):
         self.dataset_path = dataset_path
         self.n_obs_steps = n_obs_steps
         self.pred_horizon = pred_horizon
         self.image_size = image_size
+        self.augmentor = augmentor
         self.samples = []
         self._build_index()
 
@@ -123,14 +131,14 @@ class EpisodeSequenceDataset(Dataset):
             raise ValueError(f'No valid training windows found in {self.dataset_path}')
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.samples) * len(self.augmentor)
 
-    def _load_image(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
+    def _load_image(self, episode_dir: Path, frame_idx: int):
         image_path = episode_dir / 'images' / f'{frame_idx + 1:05d}.png'
         image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         if image is None:
             raise ValueError(f'Failed to read image: {image_path}')
-        return preprocess_policy_image(image, self.image_size)
+        return image
 
     def _load_command(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
         command_path = episode_dir / 'commands' / f'{frame_idx + 1:05d}.csv'
@@ -147,16 +155,15 @@ class EpisodeSequenceDataset(Dataset):
         return torch.tensor(actions, dtype=torch.float32)
 
     def __getitem__(self, idx: int):
-        episode_dir, current_idx = self.samples[idx]
+        sample_idx = idx // len(self.augmentor)
+        augment_idx = idx % len(self.augmentor)
+        episode_dir, current_idx = self.samples[sample_idx]
         obs_images = []
         for frame_idx in range(current_idx - self.n_obs_steps + 1, current_idx + 1):
             obs_images.append(self._load_image(episode_dir, frame_idx))
-
-        return (
-            torch.stack(obs_images, dim=0),
-            self._load_command(episode_dir, current_idx),
-            self._load_actions(episode_dir, current_idx),
-        )
+        actions = self._load_actions(episode_dir, current_idx)
+        augmented_images, augmented_actions = self.augmentor.apply(obs_images, actions, augment_idx)
+        return augmented_images, self._load_command(episode_dir, current_idx), augmented_actions
 
 
 def build_noise_scheduler(config: Config) -> DDPMScheduler:
@@ -178,6 +185,17 @@ def build_model(config: Config) -> DiffusionPolicy:
         down_dims=config.down_dims,
         kernel_size=config.kernel_size,
         n_groups=config.n_groups,
+    )
+
+
+def build_augmentor(config: Config) -> RecoveryAugment:
+    return RecoveryAugment(
+        RecoveryAugmentConfig(
+            lateral_pixel_offsets=config.augmentation_offsets,
+            angular_correction_gain=config.angular_correction_gain,
+            horizon_decay=config.horizon_decay,
+        ),
+        image_size=config.image_size,
     )
 
 
@@ -218,6 +236,9 @@ def save_checkpoint(
         'train_config': {
             'num_inference_steps': config.num_inference_steps,
             'image_size': config.image_size,
+            'augmentation_offsets': list(config.augmentation_offsets),
+            'angular_correction_gain': config.angular_correction_gain,
+            'horizon_decay': config.horizon_decay,
         },
         'epoch': epoch,
         'loss': loss,
@@ -229,12 +250,14 @@ def train(dataset_path: Path) -> None:
     script_dir = Path(__file__).parent
     package_root = script_dir.parent
     config = Config.load(package_root / 'config' / 'train.yaml', package_root)
+    augmentor = build_augmentor(config)
 
     dataset = EpisodeSequenceDataset(
         dataset_path=dataset_path,
         n_obs_steps=config.n_obs_steps,
         pred_horizon=config.pred_horizon,
         image_size=config.image_size,
+        augmentor=augmentor,
     )
     dataloader = DataLoader(
         dataset,

@@ -25,3 +25,8 @@ diffusion:
   beta_schedule: "squaredcos_cap_v2"
   prediction_type: "epsilon"
   clip_sample: true
+
+augmentation:
+  lateral_pixel_offsets: [-48, -24, 0, 24, 48]
+  angular_correction_gain: 0.003
+  horizon_decay: 0.5
