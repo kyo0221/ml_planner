@@ -88,6 +88,7 @@ class Trainer:
         
     def train(self, dataloader):
         self.model.to(self.config.device)
+        best_loss = float('inf')
 
         for epoch in range(self.config.epochs):
             self.model.train()
@@ -109,6 +110,10 @@ class Trainer:
             avg_loss = total_loss / len(dataloader)
             self.writer.add_scalar("loss", avg_loss, epoch)
             print(f'Epoch [{epoch+1}/{self.config.epochs}], Loss: {avg_loss:.4f}')
+            
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                torch.save(self.model.state_dict(), self.config.weights_dir / self.config.weight_file)
 
         self.writer.close()
 
