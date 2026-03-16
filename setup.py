@@ -17,6 +17,7 @@ setup(
     install_requires=[
         'setuptools',
         'diffusers',
+        'schedulefree',
     ],
     zip_safe=True,
     maintainer='kyo',

@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import schedulefree
 import torch
+import torch.multiprocessing as mp
 import yaml
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch.utils.data import DataLoader, Dataset
@@ -48,7 +50,7 @@ class Config:
     beta_schedule: str
     prediction_type: str
     clip_sample: bool
-    augmentation_offsets: tuple[int, ...]
+    augmentation_offsets: tuple[float, ...]
     angular_correction_gain: float
     horizon_decay: float
     weights_dir: Path
@@ -91,7 +93,7 @@ class Config:
             beta_schedule=str(diffusion_cfg['beta_schedule']),
             prediction_type=str(diffusion_cfg['prediction_type']),
             clip_sample=bool(diffusion_cfg['clip_sample']),
-            augmentation_offsets=tuple(int(value) for value in augmentation_cfg['lateral_pixel_offsets']),
+            augmentation_offsets=tuple(float(value) for value in augmentation_cfg['lateral_pixel_offsets']),
             angular_correction_gain=float(augmentation_cfg['angular_correction_gain']),
             horizon_decay=float(augmentation_cfg['horizon_decay']),
             weights_dir=weights_dir,
@@ -200,12 +202,30 @@ def build_augmentor(config: Config) -> RecoveryAugment:
 
 
 def fit_normalizer(dataloader: DataLoader) -> ActionNormalizer:
-    actions = []
+    total_count = 0
+    running_sum = None
+    running_sq_sum = None
+
     for _, _, batch_actions in dataloader:
-        actions.append(batch_actions)
-    stacked_actions = torch.cat(actions, dim=0)
-    normalizer = ActionNormalizer()
-    normalizer.fit(stacked_actions)
+        flat_actions = batch_actions.reshape(-1, batch_actions.shape[-1]).to(dtype=torch.float64)
+        batch_sum = flat_actions.sum(dim=0)
+        batch_sq_sum = flat_actions.square().sum(dim=0)
+
+        if running_sum is None:
+            running_sum = batch_sum
+            running_sq_sum = batch_sq_sum
+        else:
+            running_sum += batch_sum
+            running_sq_sum += batch_sq_sum
+        total_count += flat_actions.shape[0]
+
+    if total_count == 0 or running_sum is None or running_sq_sum is None:
+        raise ValueError('No actions found for normalizer fitting')
+
+    mean = running_sum / total_count
+    var = (running_sq_sum / total_count) - mean.square()
+    std = var.clamp_min(0.0).sqrt().clamp_min(1e-6)
+    normalizer = ActionNormalizer(mean=mean.to(dtype=torch.float32), std=std.to(dtype=torch.float32))
     return normalizer
 
 
@@ -247,6 +267,8 @@ def save_checkpoint(
 
 
 def train(dataset_path: Path) -> None:
+    mp.set_sharing_strategy('file_system')
+
     script_dir = Path(__file__).parent
     package_root = script_dir.parent
     config = Config.load(package_root / 'config' / 'train.yaml', package_root)
@@ -267,10 +289,11 @@ def train(dataset_path: Path) -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    normalizer = fit_normalizer(DataLoader(dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers))
+    normalizer = fit_normalizer(DataLoader(dataset, batch_size=config.batch_size, shuffle=False, num_workers=0))
     noise_scheduler = build_noise_scheduler(config)
     model = build_model(config).to(config.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = schedulefree.RAdamScheduleFree(model.parameters(), lr=config.learning_rate)
+    optimizer.train()
     writer = SummaryWriter(config.logs_dir)
 
     best_loss = float('inf')
@@ -295,10 +318,13 @@ def train(dataset_path: Path) -> None:
 
         avg_loss = total_loss / len(dataloader)
         writer.add_scalar('loss/train', avg_loss, epoch)
+        print(f'{epoch} epochs avg_loss : {avg_loss}')
 
         if avg_loss < best_loss:
             best_loss = avg_loss
+            optimizer.eval()
             save_checkpoint(config, model, optimizer, normalizer, noise_scheduler, epoch, avg_loss)
+            optimizer.train()
 
     writer.close()
 
