@@ -2,4 +2,5 @@ epochs: 200
 batch_size: 16
 learning_rate: 0.0002
 num_workers: 8
+action_chunk_size: 10
 weight_file: "hoge.pt"
