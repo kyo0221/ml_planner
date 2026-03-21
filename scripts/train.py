@@ -20,6 +20,7 @@ from utils.slit_augment import SlitAugment
 
 class MLDataset(Dataset):
     NUM_BRANCHES = 4
+    OFFSET_DECAY_STEPS = 5
 
     def __init__(self, dataset_path: str, chunk_size: int):
         dataset_root = Path(dataset_path)
@@ -46,7 +47,7 @@ class MLDataset(Dataset):
 
         image, augmented_angular_z = self.augmentor.get_augmented(image, action_chunk[0], augment_idx)
         action_offset = augmented_angular_z - action_chunk[0]
-        action_chunk = [action + action_offset for action in action_chunk]
+        action_chunk = self._apply_decayed_action_offset(action_chunk, action_offset)
 
         image = image.astype(np.float32) / 255.0
         image = np.transpose(image, (2, 0, 1))
@@ -65,6 +66,13 @@ class MLDataset(Dataset):
             self.actions[min(image_idx + step, last_index)]
             for step in range(self.chunk_size)
         ]
+
+    def _apply_decayed_action_offset(self, action_chunk: List[float], action_offset: float) -> List[float]:
+        adjusted_actions: List[float] = []
+        for step, action in enumerate(action_chunk):
+            decay_ratio = max(0.0, 1.0 - (step / self.OFFSET_DECAY_STEPS))
+            adjusted_actions.append(action + (action_offset * decay_ratio))
+        return adjusted_actions
 
     def _load_actions(self) -> List[float]:
         actions: List[float] = []
