@@ -143,16 +143,19 @@ class PlannerNode(Node):
         while self.prediction_buffer and self.prediction_buffer[0][0] < min_valid_step:
             self.prediction_buffer.popleft()
 
-        weighted_sum = 0.0
-        total_weight = 0.0
+        current_step_predictions = []
         for chunk_start_step, chunk in self.prediction_buffer:
             relative_index = self.current_step - chunk_start_step
             if relative_index < 0 or relative_index >= chunk.numel():
                 continue
 
-            prediction_age = self.current_step - chunk_start_step
-            weight = math.exp(-self.temporal_ensemble_decay * prediction_age)
-            weighted_sum += weight * float(chunk[relative_index].item())
+            current_step_predictions.append(float(chunk[relative_index].item()))
+
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for index, prediction in enumerate(current_step_predictions):
+            weight = math.exp(-self.temporal_ensemble_decay * index)
+            weighted_sum += weight * prediction
             total_weight += weight
 
         if total_weight == 0.0:
