@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections import deque
 
 from ament_index_python.packages import get_package_share_directory
 import cv2
@@ -36,6 +37,10 @@ class PlannerNode(Node):
 
         self.autonomous_flag = False
         self.command = 0
+        self.sequence_length = int(self.get_parameter('sequence_length').value)
+        self.warmup_stop_frames = int(self.get_parameter('warmup_stop_frames').value)
+        self.image_buffer = deque(maxlen=self.sequence_length)
+        self.grab_failure_count = 0
         self.cv_bridge = CvBridge()
         self.placenet_transform = transforms.Compose([
             transforms.ToTensor(),
@@ -58,6 +63,10 @@ class PlannerNode(Node):
         self.placenet_window_upper = int(self.get_parameter('placenet_window_upper').value)
         self.interval_ms = int(self.get_parameter('interval_ms').value)
 
+    def clear_image_buffer(self):
+        self.image_buffer.clear()
+        self.grab_failure_count = 0
+
     def init_torch_model(self):
         package_root = Path(get_package_share_directory('ml_planner')).parents[3] / 'src' / 'ml_planner'
         weight_path = package_root / 'weights' / self.model_path
@@ -69,14 +78,26 @@ class PlannerNode(Node):
         self.model.eval()
 
     def autonomous_callback(self, msg):
+        if msg.data != self.autonomous_flag:
+            self.clear_image_buffer()
         self.autonomous_flag = msg.data
 
     def timer_callback(self):
-        if not self.autonomous_flag or not self.zed.grab():
+        if not self.autonomous_flag:
+            self.clear_image_buffer()
             return
+
+        if not self.zed.grab():
+            self.grab_failure_count += 1
+            if self.grab_failure_count > 0:
+                self.clear_image_buffer()
+            return
+
+        self.grab_failure_count = 0
 
         image = self.zed.get_image()
         image_tensor = self.preprocess_image(image)
+        self.image_buffer.append(image_tensor)
         placenet_image_tensor = self.preprocess_placenet_image(image)
 
         command, idx = self.placenav.get_recognition(placenet_image_tensor)
@@ -84,16 +105,26 @@ class PlannerNode(Node):
         self.publish_place_recognition_debug_image(image, command)
         command_tensor = self.preprocess_command(command)
 
+        if len(self.image_buffer) < self.warmup_stop_frames:
+            self.publisher_stop()
+            return
+
+        if len(self.image_buffer) < self.sequence_length:
+            self.publisher_stop()
+            return
+
+        sequence_tensor = torch.stack(list(self.image_buffer), dim=0).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
-            output = self.model(image_tensor, command_tensor)
+            output = self.model(sequence_tensor, command_tensor)
 
         self.publisher_vel(output)
 
     def preprocess_image(self, image):
         image = image[..., :3]
         image = image[:, 112:400, :]   # 400 - 112 = 288
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).contiguous()
-        return image_tensor.to(self.device, dtype=torch.float32) / 255.0
+        image_tensor = torch.from_numpy(image).permute(2, 0, 1).contiguous()
+        return image_tensor.to(dtype=torch.float32) / 255.0
 
     def preprocess_placenet_image(self, image):
         image = image[..., :3]
@@ -123,6 +154,12 @@ class PlannerNode(Node):
         twist = Twist()
         twist.linear.x = self.linear_vel
         twist.angular.z = float(output.squeeze().item())
+        self.vel_pub.publish(twist)
+
+    def publisher_stop(self):
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
         self.vel_pub.publish(twist)
 
 
