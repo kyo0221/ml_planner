@@ -153,7 +153,7 @@ class PlannerNode(Node):
     def publisher_vel(self, output):
         twist = Twist()
         twist.linear.x = self.linear_vel
-        twist.angular.z = float(output.squeeze().item())
+        twist.angular.z = float(output[0, 0].item())
         self.vel_pub.publish(twist)
 
     def publisher_stop(self):

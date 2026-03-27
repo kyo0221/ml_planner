@@ -20,12 +20,13 @@ from utils.slit_augment import SlitAugment
 class MLDataset(Dataset):
     NUM_BRANCHES = 4
 
-    def __init__(self, dataset_path: str, sequence_length: int = 10):
+    def __init__(self, dataset_path: str, sequence_length: int = 10, prediction_horizon: int = 1):
         dataset_root = Path(dataset_path)
         self.image_dir = dataset_root / 'images'
         self.action_dir = dataset_root / 'actions'
         self.command_dir = dataset_root / 'commands'
         self.sequence_length = int(sequence_length)
+        self.prediction_horizon = int(prediction_horizon)
         self.image_paths = sorted(self.image_dir.glob('*.png'))
         self.stem_to_path = {int(path.stem): path for path in self.image_paths}
         self.action_indices = {int(path.stem) for path in self.action_dir.glob('*.csv')}
@@ -56,9 +57,18 @@ class MLDataset(Dataset):
             if end_idx not in self.action_indices or end_idx not in self.command_indices:
                 continue
 
+            horizon_indices = [end_idx + i for i in range(self.prediction_horizon)]
+            if not all(index in self.action_indices for index in horizon_indices):
+                continue
+
             valid_ends.append(end_idx)
 
         return valid_ends
+
+    def _read_angular_z(self, frame_idx: int) -> float:
+        action_file = self.action_dir / f'{frame_idx:05d}.csv'
+        with open(action_file, 'r', newline='') as f:
+            return float(next(csv.reader(f))[1])
 
     def __len__(self):
         return len(self.sequence_end_indices) * len(self.augmentor)
@@ -81,18 +91,19 @@ class MLDataset(Dataset):
             image = np.transpose(image, (2, 0, 1))
             sequence_images.append(image)
 
-        action_file = self.action_dir / f'{end_idx:05d}.csv'
         command_file = self.command_dir / f'{end_idx:05d}.csv'
-        with open(action_file, 'r', newline='') as f:
-            angular_z = float(next(csv.reader(f))[1])
-        angular_z += augment_offset
+
+        action_values = [
+            self._read_angular_z(end_idx + horizon_step) + augment_offset
+            for horizon_step in range(self.prediction_horizon)
+        ]
 
         with open(command_file, 'r', newline='') as f:
             command = float(next(csv.reader(f))[0])
 
         image_tensor = torch.from_numpy(np.stack(sequence_images, axis=0))
 
-        action_tensor = torch.tensor([angular_z], dtype=torch.float32)
+        action_tensor = torch.tensor(action_values, dtype=torch.float32)
 
         command_tensor = torch.zeros(self.NUM_BRANCHES, dtype=torch.float32)
         command_tensor[int(command)] = 1.0
@@ -111,6 +122,9 @@ class Config:
         self.num_workers = config_dict['num_workers']
         self.weight_file = config_dict['weight_file']
         self.sequence_length = int(config_dict.get('sequence_length', 10))
+        self.prediction_horizon = int(config_dict.get('prediction_horizon', 1))
+        if self.prediction_horizon < 1:
+            raise ValueError('prediction_horizon must be >= 1')
 
         self.weights_dir = package_root / 'weights'
         self.logs_dir = package_root / 'runs'
@@ -123,7 +137,7 @@ class Config:
 class Trainer:
     def __init__(self, config):
         self.config = config
-        self.model = Network()
+        self.model = Network(prediction_horizon=config.prediction_horizon)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
         self.loss = nn.MSELoss()
         self.writer = SummaryWriter(config.logs_dir)
@@ -177,6 +191,7 @@ def main():
     dataset = MLDataset(
         str(dataset_path),
         sequence_length=config.sequence_length,
+        prediction_horizon=config.prediction_horizon,
     )
     dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
     trainer = Trainer(config)

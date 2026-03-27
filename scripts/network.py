@@ -8,11 +8,12 @@ class Network(nn.Module):
     NUM_LAYERS = 2
     LSTM_DROPOUT = 0.2
 
-    def __init__(self, num_branches=4):
+    def __init__(self, num_branches=4, prediction_horizon=1):
         super().__init__()
 
         self.backbone = timm.create_model("efficientnetv2_s", pretrained=False, num_classes=0)
         self.num_branches = num_branches
+        self.prediction_horizon = int(prediction_horizon)
         feature_dim = self.backbone.num_features
 
         self.fc = nn.Linear(feature_dim, 512)
@@ -31,7 +32,7 @@ class Network(nn.Module):
                 nn.Dropout(p=0.5),
                 nn.Linear(256, 256),
                 nn.ReLU(inplace=True),
-                nn.Linear(256, 1)
+                nn.Linear(256, self.prediction_horizon)
             )
             for _ in range(num_branches)
         ])
@@ -49,7 +50,7 @@ class Network(nn.Module):
 
         batch_size = x.size(0)
         action_indices = torch.argmax(cmd, dim=1)
-        output = torch.zeros(batch_size, 1, device=x.device, dtype=x.dtype)
+        output = torch.zeros(batch_size, self.prediction_horizon, device=x.device, dtype=x.dtype)
 
         for idx, branch in enumerate(self.branches):
             mask = (action_indices == idx)
