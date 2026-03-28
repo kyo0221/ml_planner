@@ -23,8 +23,9 @@ class TopomapGenerator:
 
     def __init__(self, dataset_path):
         self.dataset_root = Path(dataset_path)
-        self.image_dir = self.dataset_root / 'images'
-        self.command_dir = self.dataset_root / 'commands'
+        self.episode_dirs = sorted(
+            p for p in self.dataset_root.glob('episode*') if p.is_dir()
+        )
 
         script_dir = Path(__file__).parent
         self.package_root = script_dir.parent
@@ -49,8 +50,8 @@ class TopomapGenerator:
     def _prepare_directories(self):
         self.topomap_images_dir.mkdir(parents=True, exist_ok=True)
 
-    def _load_command(self, image_path):
-        command_path = self.command_dir / f'{image_path.stem}.csv'
+    def _load_command(self, command_dir, stem):
+        command_path = command_dir / f'{stem}.csv'
         with command_path.open('r', newline='') as f:
             return int(float(next(csv.reader(f))[0]))
 
@@ -86,11 +87,18 @@ class TopomapGenerator:
         return output.squeeze(0).flatten().tolist()
 
     def build_nodes(self):
-        image_paths = sorted(self.image_dir.glob('*.png'))
+        image_records = []
+        for episode_dir in self.episode_dirs:
+            image_dir = episode_dir / 'images'
+            command_dir = episode_dir / 'commands'
+            for image_path in sorted(image_dir.glob('*.png')):
+                image_records.append((image_path, command_dir))
+
+        sampled_records = image_records[::self.SAVED_STEP]
         nodes = []
 
-        for idx, image_path in enumerate(image_paths[::self.SAVED_STEP]):
-            command = self._load_command(image_path)
+        for idx, (image_path, command_dir) in enumerate(sampled_records):
+            command = self._load_command(command_dir, image_path.stem)
             if command not in self.COMMAND_TO_ACTION:
                 raise ValueError(f'Unsupported command value: {command}')
 
@@ -107,7 +115,10 @@ class TopomapGenerator:
             })
 
         if not nodes:
-            raise ValueError(f'No images found in dataset: {self.image_dir}')
+            raise ValueError(
+                f'No images found in dataset: {self.dataset_root}. '
+                'Expected dataset_dir/episodeXX/{images,commands}.'
+            )
 
         for idx, node in enumerate(nodes):
             target = idx + 1 if idx + 1 < len(nodes) else idx
