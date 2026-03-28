@@ -8,5 +8,3 @@ planner_node:
     placenet_window_lower: -1
     placenet_window_upper: 2
     interval_ms: 100
-    prediction_steps: 10
-    temporal_ensemble_decay: 0.01
