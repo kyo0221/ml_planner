@@ -7,4 +7,6 @@ planner_node:
     placenet_delta: 10.0
     placenet_window_lower: -1
     placenet_window_upper: 2
-    interval_ms: 100
+    interval_ms: 200
+    sequence_length: 10
+    warmup_stop_frames: 5

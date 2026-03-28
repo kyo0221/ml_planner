@@ -24,6 +24,8 @@ class DataCreator(Node):
         self.zed = ZED_API_Utils()
         self.collected_data = []
         self.collect_flag = False
+        self.latest_vel = None
+        self.command = None
 
         self.create_subscription(Empty, '/flag', self.flag_callback, qos_profile_system_default)
         self.create_subscription(Twist, '/cmd_vel', self.vel_callback, qos_profile_system_default)
@@ -44,7 +46,10 @@ class DataCreator(Node):
         self.command = msg.data
 
     def timer_callback(self):
-        if not self.zed.grab() or not self.collect_flag:
+        if not self.collect_flag or not self.zed.grab():
+            return
+
+        if self.latest_vel is None or self.command is None:
             return
 
         image = self.zed.get_image()

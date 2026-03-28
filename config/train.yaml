@@ -3,3 +3,4 @@ batch_size: 16
 learning_rate: 0.0002
 num_workers: 8
 weight_file: "hoge.pt"
+sequence_length: 10
