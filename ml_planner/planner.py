@@ -1,5 +1,3 @@
-import math
-from collections import deque
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -59,8 +57,6 @@ class PlannerNode(Node):
         self.placenet_window_lower = int(self.get_parameter('placenet_window_lower').value)
         self.placenet_window_upper = int(self.get_parameter('placenet_window_upper').value)
         self.interval_ms = int(self.get_parameter('interval_ms').value)
-        self.prediction_steps = int(self.get_parameter('prediction_steps').value)
-        self.temporal_ensemble_decay = float(self.get_parameter('temporal_ensemble_decay').value)
 
     def init_torch_model(self):
         package_root = Path(get_package_share_directory('ml_planner')).parents[3] / 'src' / 'ml_planner'
@@ -71,19 +67,12 @@ class PlannerNode(Node):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = torch.jit.load(weight_path, map_location=self.device)
         self.model.eval()
-        self.model_chunk_size = int(getattr(self.model, 'chunk_size', self.prediction_steps))
-        if self.prediction_steps > self.model_chunk_size:
-            raise ValueError(
-                f'prediction_steps ({self.prediction_steps}) must be <= model chunk size ({self.model_chunk_size})'
-            )
-        self.prediction_buffer = deque()
-        self.current_step = 0
+        self.model_chunk_size = int(getattr(self.model, 'chunk_size', 1))
+        if self.model_chunk_size < 1:
+            raise ValueError(f'model chunk size must be >= 1, got {self.model_chunk_size}')
 
     def autonomous_callback(self, msg):
         self.autonomous_flag = msg.data
-        if not self.autonomous_flag:
-            self.prediction_buffer.clear()
-            self.current_step = 0
 
     def timer_callback(self):
         if not self.autonomous_flag or not self.zed.grab():
@@ -99,12 +88,9 @@ class PlannerNode(Node):
         command_tensor = self.preprocess_command(command)
 
         with torch.no_grad():
-            output = self.model(image_tensor, command_tensor)[0, :self.prediction_steps]
+            output = float(self.model(image_tensor, command_tensor)[0, 0].item())
 
-        ensembled_output = self.temporal_ensemble(output)
-
-        self.publisher_vel(ensembled_output)
-        self.current_step += 1
+        self.publisher_vel(output)
 
     def preprocess_image(self, image):
         image = image[..., :3]
@@ -136,33 +122,6 @@ class PlannerNode(Node):
         command_tensor[0, command_idx] = 1.0
         return command_tensor
 
-    def temporal_ensemble(self, predicted_chunk):
-        self.prediction_buffer.append((self.current_step, predicted_chunk.detach()))
-        min_valid_step = self.current_step - self.prediction_steps + 1
-
-        while self.prediction_buffer and self.prediction_buffer[0][0] < min_valid_step:
-            self.prediction_buffer.popleft()
-
-        current_step_predictions = []
-        for chunk_start_step, chunk in self.prediction_buffer:
-            relative_index = self.current_step - chunk_start_step
-            if relative_index < 0 or relative_index >= chunk.numel():
-                continue
-
-            current_step_predictions.append(float(chunk[relative_index].item()))
-
-        weighted_sum = 0.0
-        total_weight = 0.0
-        for index, prediction in enumerate(current_step_predictions):
-            weight = math.exp(-self.temporal_ensemble_decay * index)
-            weighted_sum += weight * prediction
-            total_weight += weight
-
-        if total_weight == 0.0:
-            return float(predicted_chunk[0].item())
-
-        return weighted_sum / total_weight
-    
     def publisher_vel(self, output):
         twist = Twist()
         twist.linear.x = self.linear_vel
