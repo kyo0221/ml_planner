@@ -22,68 +22,101 @@ class MLDataset(Dataset):
 
     def __init__(self, dataset_path: str, sequence_length: int = 10, prediction_horizon: int = 1):
         dataset_root = Path(dataset_path)
-        self.image_dir = dataset_root / 'images'
-        self.action_dir = dataset_root / 'actions'
-        self.command_dir = dataset_root / 'commands'
+        self.episodes = []
         self.sequence_length = int(sequence_length)
         self.prediction_horizon = int(prediction_horizon)
-        self.image_paths = sorted(self.image_dir.glob('*.png'))
-        self.stem_to_path = {int(path.stem): path for path in self.image_paths}
-        self.action_indices = {int(path.stem) for path in self.action_dir.glob('*.csv')}
-        self.command_indices = {int(path.stem) for path in self.command_dir.glob('*.csv')}
-        self.sequence_end_indices = self._build_sequence_end_indices()
+        self.sequence_samples = []
+
+        episode_dirs = sorted(
+            p for p in dataset_root.glob('episode*') if p.is_dir()
+        )
+
+        for episode_dir in episode_dirs:
+            image_dir = episode_dir / 'images'
+            action_dir = episode_dir / 'actions'
+            command_dir = episode_dir / 'commands'
+            image_paths = sorted(image_dir.glob('*.png'))
+            if not image_paths:
+                continue
+
+            stem_to_path = {int(path.stem): path for path in image_paths}
+            action_indices = {int(path.stem) for path in action_dir.glob('*.csv')}
+            command_indices = {int(path.stem) for path in command_dir.glob('*.csv')}
+
+            episode_data = {
+                'episode_dir': episode_dir,
+                'image_dir': image_dir,
+                'action_dir': action_dir,
+                'command_dir': command_dir,
+                'stem_to_path': stem_to_path,
+                'action_indices': action_indices,
+                'command_indices': command_indices,
+            }
+            episode_id = len(self.episodes)
+            self.episodes.append(episode_data)
+
+            for end_idx in self._build_episode_sequence_end_indices(episode_data):
+                self.sequence_samples.append((episode_id, end_idx))
+
+        if not self.sequence_samples:
+            raise ValueError(
+                f'No valid sequences found in dataset: {dataset_root}. '
+                'Expected dataset_dir/episodeXX/{images,actions,commands}.'
+            )
+
         self.augmentor = SlitAugment()
 
-    def _build_sequence_end_indices(self):
-        if not self.image_paths:
-            return []
-
-        sorted_indices = sorted(self.stem_to_path.keys())
+    def _build_episode_sequence_end_indices(self, episode_data):
+        sorted_indices = sorted(episode_data['stem_to_path'].keys())
         valid_ends = []
         window_span = self.sequence_length - 1
 
         for end_idx in sorted_indices:
             start_idx = end_idx - window_span
-            if start_idx < 0:
+            if start_idx < 1:
                 continue
 
             frame_indices = [start_idx + i for i in range(self.sequence_length)]
-            if not all(index in self.stem_to_path for index in frame_indices):
+            if not all(index in episode_data['stem_to_path'] for index in frame_indices):
                 continue
 
-            if not all(index in self.action_indices and index in self.command_indices for index in frame_indices):
+            if not all(
+                index in episode_data['action_indices'] and index in episode_data['command_indices']
+                for index in frame_indices
+            ):
                 continue
 
-            if end_idx not in self.action_indices or end_idx not in self.command_indices:
+            if end_idx not in episode_data['action_indices'] or end_idx not in episode_data['command_indices']:
                 continue
 
             horizon_indices = [end_idx + i for i in range(self.prediction_horizon)]
-            if not all(index in self.action_indices for index in horizon_indices):
+            if not all(index in episode_data['action_indices'] for index in horizon_indices):
                 continue
 
             valid_ends.append(end_idx)
 
         return valid_ends
 
-    def _read_angular_z(self, frame_idx: int) -> float:
-        action_file = self.action_dir / f'{frame_idx:05d}.csv'
+    def _read_angular_z(self, action_dir: Path, frame_idx: int) -> float:
+        action_file = action_dir / f'{frame_idx:05d}.csv'
         with open(action_file, 'r', newline='') as f:
             return float(next(csv.reader(f))[1])
 
     def __len__(self):
-        return len(self.sequence_end_indices) * len(self.augmentor)
+        return len(self.sequence_samples) * len(self.augmentor)
 
     def __getitem__(self, idx):
         sequence_idx = idx // len(self.augmentor)
         augment_idx = idx % len(self.augmentor)
-        end_idx = self.sequence_end_indices[sequence_idx]
+        episode_id, end_idx = self.sequence_samples[sequence_idx]
+        episode_data = self.episodes[episode_id]
         start_idx = end_idx - (self.sequence_length - 1)
         frame_indices = [start_idx + i for i in range(self.sequence_length)]
 
         sequence_images = []
         augment_offset = 0.0
         for frame_idx in frame_indices:
-            img_file = self.stem_to_path[frame_idx]
+            img_file = episode_data['stem_to_path'][frame_idx]
             image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
             image, offset = self.augmentor.get_augmented(image, 0.0, augment_idx)
             augment_offset = offset
@@ -91,10 +124,10 @@ class MLDataset(Dataset):
             image = np.transpose(image, (2, 0, 1))
             sequence_images.append(image)
 
-        command_file = self.command_dir / f'{end_idx:05d}.csv'
+        command_file = episode_data['command_dir'] / f'{end_idx:05d}.csv'
 
         action_values = [
-            self._read_angular_z(end_idx + horizon_step) + augment_offset
+            self._read_angular_z(episode_data['action_dir'], end_idx + horizon_step) + augment_offset
             for horizon_step in range(self.prediction_horizon)
         ]
 
