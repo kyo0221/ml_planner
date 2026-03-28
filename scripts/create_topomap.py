@@ -23,8 +23,7 @@ class TopomapGenerator:
 
     def __init__(self, dataset_path):
         self.dataset_root = Path(dataset_path)
-        self.image_dir = self.dataset_root / 'images'
-        self.command_dir = self.dataset_root / 'commands'
+        self.episode_dirs = sorted([path for path in self.dataset_root.glob('episode*') if path.is_dir()])
 
         script_dir = Path(__file__).parent
         self.package_root = script_dir.parent
@@ -49,8 +48,8 @@ class TopomapGenerator:
     def _prepare_directories(self):
         self.topomap_images_dir.mkdir(parents=True, exist_ok=True)
 
-    def _load_command(self, image_path):
-        command_path = self.command_dir / f'{image_path.stem}.csv'
+    def _load_command(self, command_dir, image_path):
+        command_path = command_dir / f'{image_path.stem}.csv'
         with command_path.open('r', newline='') as f:
             return int(float(next(csv.reader(f))[0]))
 
@@ -86,32 +85,41 @@ class TopomapGenerator:
         return output.squeeze(0).flatten().tolist()
 
     def build_nodes(self):
-        image_paths = sorted(self.image_dir.glob('*.png'))
         nodes = []
+        node_id = 0
 
-        for idx, image_path in enumerate(image_paths[::self.SAVED_STEP]):
-            command = self._load_command(image_path)
-            if command not in self.COMMAND_TO_ACTION:
-                raise ValueError(f'Unsupported command value: {command}')
+        for episode_dir in self.episode_dirs:
+            image_dir = episode_dir / 'images'
+            command_dir = episode_dir / 'commands'
+            episode_image_paths = sorted(image_dir.glob('*.png'))[::self.SAVED_STEP]
+            episode_nodes = []
 
-            processed_image = self._preprocess_image(image_path)
-            output_image_name = f'img{idx + 1:05d}.png'
-            output_image_path = self.topomap_images_dir / output_image_name
-            cv2.imwrite(str(output_image_path), processed_image)
+            for image_path in episode_image_paths:
+                command = self._load_command(command_dir, image_path)
+                if command not in self.COMMAND_TO_ACTION:
+                    raise ValueError(f'Unsupported command value: {command}')
 
-            nodes.append({
-                'id': idx,
-                'image': output_image_name,
-                'feature': self.extract_feature(processed_image),
-                'action': self.COMMAND_TO_ACTION[command],
-            })
+                processed_image = self._preprocess_image(image_path)
+                output_image_name = f'img{node_id + 1:05d}.png'
+                output_image_path = self.topomap_images_dir / output_image_name
+                cv2.imwrite(str(output_image_path), processed_image)
+
+                episode_nodes.append({
+                    'id': node_id,
+                    'image': output_image_name,
+                    'feature': self.extract_feature(processed_image),
+                    'action': self.COMMAND_TO_ACTION[command],
+                })
+                node_id += 1
+
+            for idx, node in enumerate(episode_nodes):
+                target = episode_nodes[idx + 1]['id'] if idx + 1 < len(episode_nodes) else node['id']
+                node['edges'] = [{'target': target, 'action': node.pop('action')}]
+
+            nodes.extend(episode_nodes)
 
         if not nodes:
-            raise ValueError(f'No images found in dataset: {self.image_dir}')
-
-        for idx, node in enumerate(nodes):
-            target = idx + 1 if idx + 1 < len(nodes) else idx
-            node['edges'] = [{'target': target, 'action': node.pop('action')}]
+            raise ValueError(f'No images found in dataset: {self.dataset_root}')
 
         return nodes
 
