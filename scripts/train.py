@@ -48,7 +48,7 @@ class MLDataset(Dataset):
         augment_idx = idx % self._num_augmentations()
         return self.get_item(sample_idx, augment_idx)
 
-    def get_item(self, sample_idx: int, augment_idx: int):
+    def get_item(self, sample_idx: int, augment_idx: int, apply_randomshadow: bool = True):
         episode_index, frame_index, img_file = self.samples[sample_idx]
 
         image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
@@ -57,7 +57,8 @@ class MLDataset(Dataset):
 
         image, action_offset = self._apply_slit_augment(image, action_chunk[0], augment_idx)
         action_chunk = self._apply_decayed_action_offset(action_chunk, action_offset)
-        image = self._apply_randomshadow(image)
+        if apply_randomshadow:
+            image = self._apply_randomshadow(image)
 
         image = image.astype(np.float32) / 255.0
         image = np.transpose(image, (2, 0, 1))
@@ -146,9 +147,10 @@ class MLDataset(Dataset):
 
 
 class SampleSplitDataset(Dataset):
-    def __init__(self, dataset: MLDataset, sample_indices: List[int]):
+    def __init__(self, dataset: MLDataset, sample_indices: List[int], apply_randomshadow: bool):
         self.dataset = dataset
         self.sample_indices = sample_indices
+        self.apply_randomshadow = apply_randomshadow
 
     def __len__(self):
         return len(self.sample_indices) * self.dataset.num_augmentations()
@@ -157,7 +159,11 @@ class SampleSplitDataset(Dataset):
         local_sample_idx = idx // self.dataset.num_augmentations()
         augment_idx = idx % self.dataset.num_augmentations()
         sample_idx = self.sample_indices[local_sample_idx]
-        return self.dataset.get_item(sample_idx, augment_idx)
+        return self.dataset.get_item(
+            sample_idx,
+            augment_idx,
+            apply_randomshadow=self.apply_randomshadow,
+        )
     
     
 class Config:
@@ -290,8 +296,8 @@ def main():
     train_indices = sample_indices[:train_count]
     test_indices = sample_indices[train_count:]
 
-    train_data = SampleSplitDataset(dataset, train_indices)
-    test_data = SampleSplitDataset(dataset, test_indices)
+    train_data = SampleSplitDataset(dataset, train_indices, apply_randomshadow=True)
+    test_data = SampleSplitDataset(dataset, test_indices, apply_randomshadow=False)
 
     train_dataloader = DataLoader(
         train_data,
