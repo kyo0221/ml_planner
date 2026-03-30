@@ -46,6 +46,9 @@ class MLDataset(Dataset):
     def __getitem__(self, idx):
         sample_idx = idx // self._num_augmentations()
         augment_idx = idx % self._num_augmentations()
+        return self.get_item(sample_idx, augment_idx)
+
+    def get_item(self, sample_idx: int, augment_idx: int):
         episode_index, frame_index, img_file = self.samples[sample_idx]
 
         image = cv2.imread(str(img_file), cv2.IMREAD_COLOR)
@@ -66,6 +69,9 @@ class MLDataset(Dataset):
         command_tensor[int(command)] = 1.0
         
         return image_tensor, action_tensor, command_tensor
+
+    def num_augmentations(self) -> int:
+        return self._num_augmentations()
 
     def _num_augmentations(self) -> int:
         if self.use_slit_augment:
@@ -90,9 +96,8 @@ class MLDataset(Dataset):
 
     def _build_action_chunk(self, episode_index: int, frame_index: int) -> List[float]:
         actions = self.episode_actions[episode_index]
-        last_index = len(actions) - 1
         return [
-            actions[min(frame_index + step, last_index)]
+            actions[frame_index + step]
             for step in range(self.chunk_size)
         ]
 
@@ -113,11 +118,10 @@ class MLDataset(Dataset):
             if not image_paths:
                 continue
 
-            episode_index = len(self.episode_actions)
             episode_actions: List[float] = []
             episode_commands: List[int] = []
 
-            for frame_index, image_path in enumerate(image_paths):
+            for image_path in image_paths:
                 action_file = action_dir / f'{image_path.stem}.csv'
                 command_file = command_dir / f'{image_path.stem}.csv'
 
@@ -127,12 +131,33 @@ class MLDataset(Dataset):
                 with open(command_file, 'r', newline='') as f:
                     episode_commands.append(int(float(next(csv.reader(f))[0])))
 
-                samples.append((episode_index, frame_index, image_path))
+            valid_start_count = len(image_paths) - self.chunk_size + 1
+            if valid_start_count <= 0:
+                continue
 
+            episode_index = len(self.episode_actions)
             self.episode_actions.append(episode_actions)
             self.episode_commands.append(episode_commands)
 
+            for frame_index in range(valid_start_count):
+                samples.append((episode_index, frame_index, image_paths[frame_index]))
+
         return samples
+
+
+class SampleSplitDataset(Dataset):
+    def __init__(self, dataset: MLDataset, sample_indices: List[int]):
+        self.dataset = dataset
+        self.sample_indices = sample_indices
+
+    def __len__(self):
+        return len(self.sample_indices) * self.dataset.num_augmentations()
+
+    def __getitem__(self, idx):
+        local_sample_idx = idx // self.dataset.num_augmentations()
+        augment_idx = idx % self.dataset.num_augmentations()
+        sample_idx = self.sample_indices[local_sample_idx]
+        return self.dataset.get_item(sample_idx, augment_idx)
     
     
 class Config:
@@ -186,15 +211,15 @@ class Trainer:
         self.loss = nn.MSELoss()
         self.writer = SummaryWriter(config.logs_dir)
         
-    def train(self, dataloader):
+    def train(self, train_dataloader, test_dataloader):
         self.model.to(self.config.device)
-        best_loss = float('inf')
+        best_test_loss = float('inf')
 
         for epoch in range(self.config.epochs):
             self.model.train()
-            total_loss = 0.0
+            total_train_loss = 0.0
 
-            for image, action, command in tqdm(dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs}'):
+            for image, action, command in tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs} [train]'):
                 image = image.to(self.config.device)
                 action = action.to(self.config.device)
                 command = command.to(self.config.device)
@@ -205,14 +230,31 @@ class Trainer:
                 loss.backward()
                 self.optimizer.step()
 
-                total_loss += loss.item()
+                total_train_loss += loss.item()
 
-            avg_loss = total_loss / len(dataloader)
-            self.writer.add_scalar("loss", avg_loss, epoch)
-            print(f'Epoch [{epoch+1}/{self.config.epochs}], Loss: {avg_loss:.4f}')
+            self.model.eval()
+            total_test_loss = 0.0
+            with torch.no_grad():
+                for image, action, command in tqdm(test_dataloader, desc=f'Epoch {epoch+1}/{self.config.epochs} [test]'):
+                    image = image.to(self.config.device)
+                    action = action.to(self.config.device)
+                    command = command.to(self.config.device)
+
+                    outputs = self.model(image, command)
+                    loss = self.loss(outputs, action)
+                    total_test_loss += loss.item()
+
+            avg_train_loss = total_train_loss / len(train_dataloader)
+            avg_test_loss = total_test_loss / len(test_dataloader)
+            self.writer.add_scalar('train_loss', avg_train_loss, epoch)
+            self.writer.add_scalar('test_loss', avg_test_loss, epoch)
+            print(
+                f'Epoch [{epoch+1}/{self.config.epochs}], '
+                f'Train Loss: {avg_train_loss:.4f}, Test Loss: {avg_test_loss:.4f}'
+            )
             
-            if avg_loss < best_loss:
-                best_loss = avg_loss
+            if avg_test_loss < best_test_loss:
+                best_test_loss = avg_test_loss
                 torch.jit.script(self.model).save(self.config.weights_dir / self.config.weight_file)
 
         self.writer.close()
@@ -238,9 +280,39 @@ def main():
         augment_config=config.augment,
         randomshadow_config=config.randomshadow,
     )
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
+    num_samples = len(dataset.samples)
+    if num_samples < 2:
+        raise ValueError('At least 2 samples are required to split into train_data and test_data')
+
+    train_count = int(num_samples * 0.7)
+    train_count = max(1, min(num_samples - 1, train_count))
+    sample_indices = torch.randperm(num_samples).tolist()
+    train_indices = sample_indices[:train_count]
+    test_indices = sample_indices[train_count:]
+
+    train_data = SampleSplitDataset(dataset, train_indices)
+    test_data = SampleSplitDataset(dataset, test_indices)
+
+    train_dataloader = DataLoader(
+        train_data,
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+    )
+    test_dataloader = DataLoader(
+        test_data,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+
+    print(
+        f'Split dataset into train_data={len(train_indices)} samples and '
+        f'test_data={len(test_indices)} samples (ratio 7:3)'
+    )
+
     trainer = Trainer(config)
-    trainer.train(dataloader)
+    trainer.train(train_dataloader, test_dataloader)
 
 if __name__ == '__main__':
     main()
