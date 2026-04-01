@@ -1,8 +1,8 @@
-epochs: 300
+epochs: 200
 batch_size: 32
 learning_rate: 0.0001
 num_workers: 2
-weight_file: "recovery_max_crop.pt"
+weight_file: "haruyama_course_diffusion.pt"
 
 dataset:
   n_obs_steps: 2
@@ -12,21 +12,15 @@ dataset:
 vision:
   image_size: 224
 
-model:
-  diffusion_step_embed_dim: 256
-  global_cond_dim: 512
-  down_dims: [64, 128, 256]
-  kernel_size: 5
-  n_groups: 8
+augment:
+  crop: true
+  randomshadow: false
 
-diffusion:
-  num_train_timesteps: 100
-  num_inference_steps: 10
-  beta_schedule: "squaredcos_cap_v2"
-  prediction_type: "epsilon"
-  clip_sample: true
-
-augmentation:
-  lateral_pixel_offsets: [-1.0, -0.5, 0.0, 0.5, 1.0]
-  angular_correction_gain: 0.00357
-  horizon_decay: 0.5
+randomshadow:
+  p: 0.5
+  high_ratio: [1.0, 2.0]
+  low_ratio: [0.01, 0.5]
+  left_low_ratio: [0.4, 0.6]
+  left_high_ratio: [0.0, 0.2]
+  right_low_ratio: [0.4, 0.6]
+  right_high_ratio: [0.0, 0.2]

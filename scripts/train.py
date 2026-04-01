@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+import numpy as np
+from PIL import Image
 import schedulefree
 import torch
 import torch.multiprocessing as mp
@@ -16,15 +18,16 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from ml_planner.models import ActionNormalizer, DiffusionPolicy
-from scripts.utils.recovery_augment import RecoveryAugment, RecoveryAugmentConfig
+from scripts.utils.random_shadows_highlights import RandomShadows
+from scripts.utils.slit_augment import SlitAugment
 
 
-def load_scalar_csv(path: Path) -> float:
+def load_scalar_csv(path):
     with path.open('r', newline='') as f:
         return float(next(csv.reader(f))[0])
 
 
-def load_action_csv(path: Path) -> float:
+def load_action_csv(path):
     with path.open('r', newline='') as f:
         return float(next(csv.reader(f))[1])
 
@@ -40,34 +43,19 @@ class Config:
     pred_horizon: int
     action_dim: int
     image_size: int
-    diffusion_step_embed_dim: int
-    global_cond_dim: int
-    down_dims: tuple[int, ...]
-    kernel_size: int
-    n_groups: int
-    num_train_timesteps: int
-    num_inference_steps: int
-    beta_schedule: str
-    prediction_type: str
-    clip_sample: bool
-    augmentation_offsets: tuple[float, ...]
-    angular_correction_gain: float
-    horizon_decay: float
+    augment: dict
+    randomshadow: dict
     weights_dir: Path
     logs_dir: Path
     device: torch.device
 
     @classmethod
-    def load(cls, config_path: Path, package_root: Path):
+    def load(cls, config_path, package_root):
         with config_path.open('r', encoding='utf-8') as f:
             config_dict = yaml.safe_load(f)
 
         dataset_cfg = config_dict['dataset']
         vision_cfg = config_dict['vision']
-        model_cfg = config_dict['model']
-        diffusion_cfg = config_dict['diffusion']
-        augmentation_cfg = config_dict['augmentation']
-
         weights_dir = package_root / 'weights'
         logs_dir = package_root / 'runs'
         weights_dir.mkdir(exist_ok=True)
@@ -83,125 +71,188 @@ class Config:
             pred_horizon=int(dataset_cfg['pred_horizon']),
             action_dim=int(dataset_cfg['action_dim']),
             image_size=int(vision_cfg['image_size']),
-            diffusion_step_embed_dim=int(model_cfg['diffusion_step_embed_dim']),
-            global_cond_dim=int(model_cfg['global_cond_dim']),
-            down_dims=tuple(model_cfg['down_dims']),
-            kernel_size=int(model_cfg['kernel_size']),
-            n_groups=int(model_cfg['n_groups']),
-            num_train_timesteps=int(diffusion_cfg['num_train_timesteps']),
-            num_inference_steps=int(diffusion_cfg['num_inference_steps']),
-            beta_schedule=str(diffusion_cfg['beta_schedule']),
-            prediction_type=str(diffusion_cfg['prediction_type']),
-            clip_sample=bool(diffusion_cfg['clip_sample']),
-            augmentation_offsets=tuple(float(value) for value in augmentation_cfg['lateral_pixel_offsets']),
-            angular_correction_gain=float(augmentation_cfg['angular_correction_gain']),
-            horizon_decay=float(augmentation_cfg['horizon_decay']),
+            augment=config_dict.get('augment', {}),
+            randomshadow=cls._load_randomshadow_config(config_dict.get('randomshadow', {})),
             weights_dir=weights_dir,
             logs_dir=logs_dir,
             device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
         )
 
+    @staticmethod
+    def _load_randomshadow_config(config):
+        required_keys = (
+            'p',
+            'high_ratio',
+            'low_ratio',
+            'left_low_ratio',
+            'left_high_ratio',
+            'right_low_ratio',
+            'right_high_ratio',
+        )
 
-class EpisodeSequenceDataset(Dataset):
+        missing_keys = [key for key in required_keys if key not in config]
+        if missing_keys:
+            raise ValueError(f'Missing randomshadow config keys in train.yaml: {missing_keys}')
+
+        parsed = dict(config)
+        for key in required_keys[1:]:
+            parsed[key] = tuple(parsed[key])
+        return parsed
+
+
+class MLDataset(Dataset):
     NUM_COMMANDS = 4
+    OFFSET_DECAY_STEPS = 5
 
-    def __init__(self, dataset_path: Path, n_obs_steps: int, pred_horizon: int, image_size: int, augmentor: RecoveryAugment):
-        self.dataset_path = dataset_path
+    def __init__(self, dataset_path, n_obs_steps, pred_horizon, image_size, augment_config, randomshadow_config):
+        dataset_root = Path(dataset_path)
+        self.episode_dirs = sorted([path for path in dataset_root.glob('episode*') if path.is_dir()])
         self.n_obs_steps = n_obs_steps
-        self.pred_horizon = pred_horizon
+        self.chunk_size = pred_horizon
         self.image_size = image_size
-        self.augmentor = augmentor
+        self.use_slit_augment = bool(augment_config.get('crop', True))
+        self.use_randomshadow = bool(augment_config.get('randomshadow', False))
+        self.augmentor = SlitAugment()
+        self.randomshadow = RandomShadows(**randomshadow_config)
         self.samples = []
-        self._build_index()
+        self.episode_actions = []
+        self.episode_commands = []
+        self.samples = self._build_samples()
 
-    def _build_index(self) -> None:
-        episode_dirs = sorted(path for path in self.dataset_path.glob('episode_*') if path.is_dir())
-        if not episode_dirs:
-            raise ValueError(f'No episode directories found in {self.dataset_path}')
+        if not self.samples:
+            raise ValueError(f'No training samples found in dataset: {dataset_root}')
 
-        for episode_dir in episode_dirs:
+    def __len__(self):
+        return len(self.samples) * self._num_augmentations()
+
+    def num_augmentations(self):
+        return self._num_augmentations()
+
+    def _num_augmentations(self):
+        if self.use_slit_augment:
+            return len(self.augmentor)
+        return 1
+
+    def _build_action_chunk(self, episode_index, frame_index):
+        actions = self.episode_actions[episode_index]
+        return [
+            actions[frame_index + step]
+            for step in range(self.chunk_size)
+        ]
+
+    def _apply_decayed_action_offset(self, action_chunk, action_offset):
+        adjusted_actions = []
+        for step, action in enumerate(action_chunk):
+            decay_ratio = max(0.0, 1.0 - (step / self.OFFSET_DECAY_STEPS))
+            adjusted_actions.append(action + (action_offset * decay_ratio))
+        return adjusted_actions
+
+    def _apply_slit_augment(self, image, angular_z, augment_idx):
+        if not self.use_slit_augment:
+            return image, 0.0
+
+        augmented_image, augmented_angular_z = self.augmentor.get_augmented(image, angular_z, augment_idx)
+        return augmented_image, augmented_angular_z - angular_z
+
+    def _apply_randomshadow(self, image):
+        if not self.use_randomshadow or self.randomshadow is None:
+            return image
+
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(image_rgb)
+        augmented_pil = self.randomshadow(pil_image)
+        augmented_rgb = np.array(augmented_pil)
+        return cv2.cvtColor(augmented_rgb, cv2.COLOR_RGB2BGR)
+
+    def _preprocess_image(self, image):
+        resized = cv2.resize(image[..., :3], (self.image_size, self.image_size), interpolation=cv2.INTER_AREA)
+        normalized = resized.astype(np.float32) / 255.0
+        return torch.from_numpy(normalized.transpose(2, 0, 1))
+
+    def __getitem__(self, idx):
+        sample_idx = idx // self._num_augmentations()
+        augment_idx = idx % self._num_augmentations()
+        return self.get_item(sample_idx, augment_idx)
+
+    def get_item(self, sample_idx, augment_idx, apply_randomshadow=True):
+        episode_index, current_idx, _ = self.samples[sample_idx]
+        obs_images = []
+        action_chunk = self._build_action_chunk(episode_index, current_idx)
+        action_offset = 0.0
+        for frame_idx in range(current_idx - self.n_obs_steps + 1, current_idx + 1):
+            image_path = self.episode_dirs[episode_index] / 'images' / f'{frame_idx + 1:05d}.png'
+            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f'Failed to read image: {image_path}')
+
+            image, action_offset = self._apply_slit_augment(image, action_chunk[0], augment_idx)
+            if apply_randomshadow:
+                image = self._apply_randomshadow(image)
+            obs_images.append(image)
+
+        action_chunk = self._apply_decayed_action_offset(action_chunk, action_offset)
+
+        actions = torch.tensor([[value] for value in action_chunk], dtype=torch.float32)
+        image_tensor = torch.stack([self._preprocess_image(image) for image in obs_images], dim=0)
+        command = torch.zeros(self.NUM_COMMANDS, dtype=torch.float32)
+        command_idx = self.episode_commands[episode_index][current_idx]
+        command[command_idx] = 1.0
+        return image_tensor, command, actions
+
+
+    def _build_samples(self):
+        if not self.episode_dirs:
+            raise ValueError('No episode directories found in dataset path')
+
+        samples = []
+        for episode_dir in self.episode_dirs:
             image_paths = sorted((episode_dir / 'images').glob('*.png'))
             if not image_paths:
                 continue
 
-            num_frames = len(image_paths)
-            max_start = num_frames - self.pred_horizon + 1
+            actions = []
+            commands = []
+            for frame_idx in range(len(image_paths)):
+                action_path = episode_dir / 'actions' / f'{frame_idx + 1:05d}.csv'
+                command_path = episode_dir / 'commands' / f'{frame_idx + 1:05d}.csv'
+                actions.append(load_action_csv(action_path))
+                commands.append(int(load_scalar_csv(command_path)))
+
+            max_start = len(image_paths) - self.chunk_size + 1
+            if max_start <= self.n_obs_steps - 1:
+                continue
+
+            episode_index = len(self.episode_actions)
+            self.episode_actions.append(actions)
+            self.episode_commands.append(commands)
+
             for current_idx in range(self.n_obs_steps - 1, max_start):
-                self.samples.append((episode_dir, current_idx))
+                samples.append((episode_index, current_idx, image_paths[current_idx]))
 
-        if not self.samples:
-            raise ValueError(f'No valid training windows found in {self.dataset_path}')
-
-    def __len__(self) -> int:
-        return len(self.samples) * len(self.augmentor)
-
-    def _load_image(self, episode_dir: Path, frame_idx: int):
-        image_path = episode_dir / 'images' / f'{frame_idx + 1:05d}.png'
-        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f'Failed to read image: {image_path}')
-        return image
-
-    def _load_command(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
-        command_path = episode_dir / 'commands' / f'{frame_idx + 1:05d}.csv'
-        command_idx = int(load_scalar_csv(command_path))
-        command = torch.zeros(self.NUM_COMMANDS, dtype=torch.float32)
-        command[command_idx] = 1.0
-        return command
-
-    def _load_actions(self, episode_dir: Path, frame_idx: int) -> torch.Tensor:
-        actions = []
-        for offset in range(self.pred_horizon):
-            action_path = episode_dir / 'actions' / f'{frame_idx + offset + 1:05d}.csv'
-            actions.append([load_action_csv(action_path)])
-        return torch.tensor(actions, dtype=torch.float32)
-
-    def __getitem__(self, idx: int):
-        sample_idx = idx // len(self.augmentor)
-        augment_idx = idx % len(self.augmentor)
-        episode_dir, current_idx = self.samples[sample_idx]
-        obs_images = []
-        for frame_idx in range(current_idx - self.n_obs_steps + 1, current_idx + 1):
-            obs_images.append(self._load_image(episode_dir, frame_idx))
-        actions = self._load_actions(episode_dir, current_idx)
-        augmented_images, augmented_actions = self.augmentor.apply(obs_images, actions, augment_idx)
-        return augmented_images, self._load_command(episode_dir, current_idx), augmented_actions
+        return samples
 
 
-def build_noise_scheduler(config: Config) -> DDPMScheduler:
-    return DDPMScheduler(
-        num_train_timesteps=config.num_train_timesteps,
-        beta_schedule=config.beta_schedule,
-        prediction_type=config.prediction_type,
-        clip_sample=config.clip_sample,
-    )
+class SampleSplitDataset(Dataset):
+    def __init__(self, dataset, sample_indices, apply_randomshadow):
+        self.dataset = dataset
+        self.sample_indices = sample_indices
+        self.apply_randomshadow = apply_randomshadow
+
+    def __len__(self):
+        return len(self.sample_indices) * self.dataset.num_augmentations()
+
+    def __getitem__(self, idx):
+        local_sample_idx = idx // self.dataset.num_augmentations()
+        augment_idx = idx % self.dataset.num_augmentations()
+        sample_idx = self.sample_indices[local_sample_idx]
+        return self.dataset.get_item(
+            sample_idx,
+            augment_idx,
+            apply_randomshadow=self.apply_randomshadow,
+        )
 
 
-def build_model(config: Config) -> DiffusionPolicy:
-    return DiffusionPolicy(
-        action_dim=config.action_dim,
-        pred_horizon=config.pred_horizon,
-        n_obs_steps=config.n_obs_steps,
-        diffusion_step_embed_dim=config.diffusion_step_embed_dim,
-        global_cond_dim=config.global_cond_dim,
-        down_dims=config.down_dims,
-        kernel_size=config.kernel_size,
-        n_groups=config.n_groups,
-    )
-
-
-def build_augmentor(config: Config) -> RecoveryAugment:
-    return RecoveryAugment(
-        RecoveryAugmentConfig(
-            lateral_pixel_offsets=config.augmentation_offsets,
-            angular_correction_gain=config.angular_correction_gain,
-            horizon_decay=config.horizon_decay,
-        ),
-        image_size=config.image_size,
-    )
-
-
-def fit_normalizer(dataloader: DataLoader) -> ActionNormalizer:
+def fit_normalizer(dataloader):
     total_count = 0
     running_sum = None
     running_sq_sum = None
@@ -229,15 +280,25 @@ def fit_normalizer(dataloader: DataLoader) -> ActionNormalizer:
     return normalizer
 
 
+def split_sample_indices(total_samples, train_ratio=0.7):
+    if total_samples < 2:
+        raise ValueError('At least 2 samples are required to split into train_data and test_data')
+
+    train_count = int(total_samples * train_ratio)
+    train_count = max(1, min(total_samples - 1, train_count))
+    shuffled_indices = torch.randperm(total_samples).tolist()
+    return shuffled_indices[:train_count], shuffled_indices[train_count:]
+
+
 def save_checkpoint(
-    config: Config,
-    model: DiffusionPolicy,
-    optimizer: torch.optim.Optimizer,
-    normalizer: ActionNormalizer,
-    scheduler: DDPMScheduler,
-    epoch: int,
-    loss: float,
-) -> None:
+    config,
+    model,
+    optimizer,
+    normalizer,
+    scheduler,
+    epoch,
+    loss,
+):
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -246,19 +307,12 @@ def save_checkpoint(
             'action_dim': config.action_dim,
             'pred_horizon': config.pred_horizon,
             'n_obs_steps': config.n_obs_steps,
-            'diffusion_step_embed_dim': config.diffusion_step_embed_dim,
-            'global_cond_dim': config.global_cond_dim,
-            'down_dims': list(config.down_dims),
-            'kernel_size': config.kernel_size,
-            'n_groups': config.n_groups,
         },
         'scheduler_config': dict(scheduler.config),
         'train_config': {
-            'num_inference_steps': config.num_inference_steps,
             'image_size': config.image_size,
-            'augmentation_offsets': list(config.augmentation_offsets),
-            'angular_correction_gain': config.angular_correction_gain,
-            'horizon_decay': config.horizon_decay,
+            'augment': config.augment,
+            'randomshadow': config.randomshadow,
         },
         'epoch': epoch,
         'loss': loss,
@@ -266,42 +320,62 @@ def save_checkpoint(
     torch.save(checkpoint, config.weights_dir / config.weight_file)
 
 
-def train(dataset_path: Path) -> None:
+def train(dataset_path):
     mp.set_sharing_strategy('file_system')
 
     script_dir = Path(__file__).parent
     package_root = script_dir.parent
     config = Config.load(package_root / 'config' / 'train.yaml', package_root)
-    augmentor = build_augmentor(config)
 
-    dataset = EpisodeSequenceDataset(
+    dataset = MLDataset(
         dataset_path=dataset_path,
         n_obs_steps=config.n_obs_steps,
         pred_horizon=config.pred_horizon,
         image_size=config.image_size,
-        augmentor=augmentor,
+        augment_config=config.augment,
+        randomshadow_config=config.randomshadow,
     )
-    dataloader = DataLoader(
-        dataset,
+    train_indices, test_indices = split_sample_indices(len(dataset.samples), train_ratio=0.7)
+    train_dataset = SampleSplitDataset(dataset, train_indices, apply_randomshadow=True)
+    test_dataset = SampleSplitDataset(dataset, test_indices, apply_randomshadow=False)
+
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=torch.cuda.is_available(),
     )
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
 
-    normalizer = fit_normalizer(DataLoader(dataset, batch_size=config.batch_size, shuffle=False, num_workers=0))
-    noise_scheduler = build_noise_scheduler(config)
-    model = build_model(config).to(config.device)
+    print(
+        f'Split dataset into train_data={len(train_indices)} samples and '
+        f'test_data={len(test_indices)} samples (ratio 7:3)'
+    )
+
+    normalizer = fit_normalizer(DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0))
+    noise_scheduler = DDPMScheduler()
+    model = DiffusionPolicy(
+        action_dim=config.action_dim,
+        pred_horizon=config.pred_horizon,
+        n_obs_steps=config.n_obs_steps,
+    ).to(config.device)
     optimizer = schedulefree.RAdamScheduleFree(model.parameters(), lr=config.learning_rate)
     optimizer.train()
     writer = SummaryWriter(config.logs_dir)
 
-    best_loss = float('inf')
+    best_test_loss = float('inf')
     for epoch in range(config.epochs):
         model.train()
-        total_loss = 0.0
+        total_train_loss = 0.0
 
-        progress = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{config.epochs}')
+        progress = tqdm(train_dataloader, desc=f'Epoch {epoch + 1}/{config.epochs} [train]')
         for obs_images, command, actions in progress:
             obs_images = obs_images.to(config.device, dtype=torch.float32)
             command = command.to(config.device, dtype=torch.float32)
@@ -313,18 +387,36 @@ def train(dataset_path: Path) -> None:
             optimizer.step()
 
             loss_value = loss.item()
-            total_loss += loss_value
+            total_train_loss += loss_value
             progress.set_postfix(loss=f'{loss_value:.4f}')
 
-        avg_loss = total_loss / len(dataloader)
-        writer.add_scalar('loss/train', avg_loss, epoch)
-        print(f'{epoch} epochs avg_loss : {avg_loss}')
+        model.eval()
+        optimizer.eval()
+        total_test_loss = 0.0
+        with torch.no_grad():
+            eval_progress = tqdm(test_dataloader, desc=f'Epoch {epoch + 1}/{config.epochs} [test]')
+            for obs_images, command, actions in eval_progress:
+                obs_images = obs_images.to(config.device, dtype=torch.float32)
+                command = command.to(config.device, dtype=torch.float32)
+                actions = normalizer.normalize(actions.to(config.device, dtype=torch.float32))
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            optimizer.eval()
-            save_checkpoint(config, model, optimizer, normalizer, noise_scheduler, epoch, avg_loss)
-            optimizer.train()
+                loss = model.compute_loss(obs_images, command, actions, noise_scheduler)
+                total_test_loss += loss.item()
+
+        avg_train_loss = total_train_loss / len(train_dataloader)
+        avg_test_loss = total_test_loss / len(test_dataloader)
+        writer.add_scalar('loss/train', avg_train_loss, epoch)
+        writer.add_scalar('loss/test', avg_test_loss, epoch)
+        print(
+            f'Epoch {epoch + 1}/{config.epochs}, '
+            f'train_loss={avg_train_loss:.6f}, test_loss={avg_test_loss:.6f}'
+        )
+
+        if avg_test_loss < best_test_loss:
+            best_test_loss = avg_test_loss
+            save_checkpoint(config, model, optimizer, normalizer, noise_scheduler, epoch, avg_test_loss)
+
+        optimizer.train()
 
     writer.close()
 
