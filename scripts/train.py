@@ -39,7 +39,6 @@ class Config:
     learning_rate: float
     num_workers: int
     weight_file: str
-    n_obs_steps: int
     pred_horizon: int
     action_dim: int
     image_size: int
@@ -67,7 +66,6 @@ class Config:
             learning_rate=float(config_dict['learning_rate']),
             num_workers=int(config_dict['num_workers']),
             weight_file=str(config_dict['weight_file']),
-            n_obs_steps=int(dataset_cfg['n_obs_steps']),
             pred_horizon=int(dataset_cfg['pred_horizon']),
             action_dim=int(dataset_cfg['action_dim']),
             image_size=int(vision_cfg['image_size']),
@@ -104,10 +102,9 @@ class MLDataset(Dataset):
     NUM_COMMANDS = 4
     OFFSET_DECAY_STEPS = 5
 
-    def __init__(self, dataset_path, n_obs_steps, pred_horizon, image_size, augment_config, randomshadow_config):
+    def __init__(self, dataset_path, pred_horizon, image_size, augment_config, randomshadow_config):
         dataset_root = Path(dataset_path)
         self.episode_dirs = sorted([path for path in dataset_root.glob('episode*') if path.is_dir()])
-        self.n_obs_steps = n_obs_steps
         self.chunk_size = pred_horizon
         self.image_size = image_size
         self.use_slit_augment = bool(augment_config.get('crop', True))
@@ -175,25 +172,20 @@ class MLDataset(Dataset):
         return self.get_item(sample_idx, augment_idx)
 
     def get_item(self, sample_idx, augment_idx, apply_randomshadow=True):
-        episode_index, current_idx, _ = self.samples[sample_idx]
-        obs_images = []
+        episode_index, current_idx, image_path = self.samples[sample_idx]
         action_chunk = self._build_action_chunk(episode_index, current_idx)
-        action_offset = 0.0
-        for frame_idx in range(current_idx - self.n_obs_steps + 1, current_idx + 1):
-            image_path = self.episode_dirs[episode_index] / 'images' / f'{frame_idx + 1:05d}.png'
-            image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f'Failed to read image: {image_path}')
+        image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+        if image is None:
+            raise ValueError(f'Failed to read image: {image_path}')
 
-            image, action_offset = self._apply_slit_augment(image, action_chunk[0], augment_idx)
-            if apply_randomshadow:
-                image = self._apply_randomshadow(image)
-            obs_images.append(image)
+        image, action_offset = self._apply_slit_augment(image, action_chunk[0], augment_idx)
+        if apply_randomshadow:
+            image = self._apply_randomshadow(image)
 
         action_chunk = self._apply_decayed_action_offset(action_chunk, action_offset)
 
         actions = torch.tensor([[value] for value in action_chunk], dtype=torch.float32)
-        image_tensor = torch.stack([self._preprocess_image(image) for image in obs_images], dim=0)
+        image_tensor = self._preprocess_image(image)
         command = torch.zeros(self.NUM_COMMANDS, dtype=torch.float32)
         command_idx = self.episode_commands[episode_index][current_idx]
         command[command_idx] = 1.0
@@ -210,24 +202,29 @@ class MLDataset(Dataset):
             if not image_paths:
                 continue
 
+            valid_image_paths = []
             actions = []
             commands = []
-            for frame_idx in range(len(image_paths)):
-                action_path = episode_dir / 'actions' / f'{frame_idx + 1:05d}.csv'
-                command_path = episode_dir / 'commands' / f'{frame_idx + 1:05d}.csv'
+            for image_path in image_paths:
+                action_path = episode_dir / 'actions' / f'{image_path.stem}.csv'
+                command_path = episode_dir / 'commands' / f'{image_path.stem}.csv'
+                if not action_path.exists() or not command_path.exists():
+                    continue
+
+                valid_image_paths.append(image_path)
                 actions.append(load_action_csv(action_path))
                 commands.append(int(load_scalar_csv(command_path)))
 
-            max_start = len(image_paths) - self.chunk_size + 1
-            if max_start <= self.n_obs_steps - 1:
+            max_start = len(valid_image_paths) - self.chunk_size + 1
+            if max_start <= 0:
                 continue
 
             episode_index = len(self.episode_actions)
             self.episode_actions.append(actions)
             self.episode_commands.append(commands)
 
-            for current_idx in range(self.n_obs_steps - 1, max_start):
-                samples.append((episode_index, current_idx, image_paths[current_idx]))
+            for current_idx in range(max_start):
+                samples.append((episode_index, current_idx, valid_image_paths[current_idx]))
 
         return samples
 
@@ -252,32 +249,15 @@ class SampleSplitDataset(Dataset):
         )
 
 
-def fit_normalizer(dataloader):
-    total_count = 0
-    running_sum = None
-    running_sq_sum = None
+def build_fixed_range_normalizer(action_dim, action_min=-1.0, action_max=1.0):
+    if action_max <= action_min:
+        raise ValueError(f'Invalid action range: min={action_min}, max={action_max}')
 
-    for _, _, batch_actions in dataloader:
-        flat_actions = batch_actions.reshape(-1, batch_actions.shape[-1]).to(dtype=torch.float64)
-        batch_sum = flat_actions.sum(dim=0)
-        batch_sq_sum = flat_actions.square().sum(dim=0)
-
-        if running_sum is None:
-            running_sum = batch_sum
-            running_sq_sum = batch_sq_sum
-        else:
-            running_sum += batch_sum
-            running_sq_sum += batch_sq_sum
-        total_count += flat_actions.shape[0]
-
-    if total_count == 0 or running_sum is None or running_sq_sum is None:
-        raise ValueError('No actions found for normalizer fitting')
-
-    mean = running_sum / total_count
-    var = (running_sq_sum / total_count) - mean.square()
-    std = var.clamp_min(0.0).sqrt().clamp_min(1e-6)
-    normalizer = ActionNormalizer(mean=mean.to(dtype=torch.float32), std=std.to(dtype=torch.float32))
-    return normalizer
+    midpoint = (action_max + action_min) / 2.0
+    half_range = (action_max - action_min) / 2.0
+    mean = torch.full((action_dim,), midpoint, dtype=torch.float32)
+    std = torch.full((action_dim,), half_range, dtype=torch.float32)
+    return ActionNormalizer(mean=mean, std=std)
 
 
 def split_sample_indices(total_samples, train_ratio=0.7):
@@ -306,7 +286,6 @@ def save_checkpoint(
         'model_config': {
             'action_dim': config.action_dim,
             'pred_horizon': config.pred_horizon,
-            'n_obs_steps': config.n_obs_steps,
         },
         'scheduler_config': dict(scheduler.config),
         'train_config': {
@@ -329,7 +308,6 @@ def train(dataset_path):
 
     dataset = MLDataset(
         dataset_path=dataset_path,
-        n_obs_steps=config.n_obs_steps,
         pred_horizon=config.pred_horizon,
         image_size=config.image_size,
         augment_config=config.augment,
@@ -359,12 +337,11 @@ def train(dataset_path):
         f'test_data={len(test_indices)} samples (ratio 7:3)'
     )
 
-    normalizer = fit_normalizer(DataLoader(train_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0))
+    normalizer = build_fixed_range_normalizer(config.action_dim, action_min=-1.0, action_max=1.0)
     noise_scheduler = DDPMScheduler()
     model = DiffusionPolicy(
         action_dim=config.action_dim,
         pred_horizon=config.pred_horizon,
-        n_obs_steps=config.n_obs_steps,
     ).to(config.device)
     optimizer = schedulefree.RAdamScheduleFree(model.parameters(), lr=config.learning_rate)
     optimizer.train()
@@ -377,7 +354,7 @@ def train(dataset_path):
 
         progress = tqdm(train_dataloader, desc=f'Epoch {epoch + 1}/{config.epochs} [train]')
         for obs_images, command, actions in progress:
-            obs_images = obs_images.to(config.device, dtype=torch.float32)
+            obs_images = obs_images.to(config.device, dtype=torch.float32).unsqueeze(1)
             command = command.to(config.device, dtype=torch.float32)
             actions = normalizer.normalize(actions.to(config.device, dtype=torch.float32))
 
@@ -396,7 +373,7 @@ def train(dataset_path):
         with torch.no_grad():
             eval_progress = tqdm(test_dataloader, desc=f'Epoch {epoch + 1}/{config.epochs} [test]')
             for obs_images, command, actions in eval_progress:
-                obs_images = obs_images.to(config.device, dtype=torch.float32)
+                obs_images = obs_images.to(config.device, dtype=torch.float32).unsqueeze(1)
                 command = command.to(config.device, dtype=torch.float32)
                 actions = normalizer.normalize(actions.to(config.device, dtype=torch.float32))
 
