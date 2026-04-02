@@ -12,3 +12,5 @@ __pycache__
 /weights
 /config/topomap*
 /docs
+/ml_planner.egg-info
+/weights
