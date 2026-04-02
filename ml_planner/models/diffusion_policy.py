@@ -13,7 +13,6 @@ class DiffusionPolicy(nn.Module):
         self,
         action_dim: int,
         pred_horizon: int,
-        n_obs_steps: int,
         diffusion_step_embed_dim: int = 256,
         global_cond_dim: int = 512,
         down_dims: tuple[int, ...] = (64, 128, 256),
@@ -23,10 +22,9 @@ class DiffusionPolicy(nn.Module):
         super().__init__()
         self.action_dim = action_dim
         self.pred_horizon = pred_horizon
-        self.n_obs_steps = n_obs_steps
 
         self.vision_encoder = VisionEncoder()
-        vision_dim = self.vision_encoder.feature_dim * n_obs_steps
+        vision_dim = self.vision_encoder.feature_dim
 
         self.command_encoder = nn.Sequential(
             nn.Linear(self.NUM_COMMANDS, 128),
@@ -48,6 +46,11 @@ class DiffusionPolicy(nn.Module):
         )
 
     def encode_condition(self, obs_images: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
+        if obs_images.ndim == 4:
+            obs_images = obs_images.unsqueeze(1)
+        if obs_images.shape[1] != 1:
+            obs_images = obs_images[:, -1:, ...]
+
         image_feature = self.vision_encoder(obs_images).flatten(start_dim=1)
         command_feature = self.command_encoder(command)
         return self.global_condition(torch.cat((image_feature, command_feature), dim=1))
@@ -103,5 +106,4 @@ class DiffusionPolicy(nn.Module):
         return {
             'action_dim': self.action_dim,
             'pred_horizon': self.pred_horizon,
-            'n_obs_steps': self.n_obs_steps,
         }

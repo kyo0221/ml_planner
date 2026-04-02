@@ -78,12 +78,11 @@ class PlannerNode(Node):
         self.model = DiffusionPolicy(
             action_dim=model_config['action_dim'],
             pred_horizon=model_config['pred_horizon'],
-            n_obs_steps=model_config['n_obs_steps'],
-            diffusion_step_embed_dim=model_config['diffusion_step_embed_dim'],
-            global_cond_dim=model_config['global_cond_dim'],
-            down_dims=tuple(model_config['down_dims']),
-            kernel_size=model_config['kernel_size'],
-            n_groups=model_config['n_groups'],
+            diffusion_step_embed_dim=model_config.get('diffusion_step_embed_dim', 256),
+            global_cond_dim=model_config.get('global_cond_dim', 512),
+            down_dims=tuple(model_config.get('down_dims', (64, 128, 256))),
+            kernel_size=model_config.get('kernel_size', 5),
+            n_groups=model_config.get('n_groups', 8),
         )
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.model.to(self.device)
