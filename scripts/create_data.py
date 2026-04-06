@@ -112,6 +112,7 @@ class DataCreator(Node):
         if not self.zed.grab() or not self.collect_flag:
             return
         if self.latest_odom is None or self.current_episode_dir is None:
+            self.get_logger().info(f'not ready latest_odom: {self.latest_odom}, current_episode_dir: {self.current_episode_dir}')
             return
 
         image = self.zed.get_image()
