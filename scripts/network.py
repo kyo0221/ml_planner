@@ -4,11 +4,12 @@ import timm
 
 
 class Network(nn.Module):
-    def __init__(self, num_branches=4):
+    def __init__(self, num_branches=4, chunk_size=1):
         super().__init__()
 
         self.backbone = timm.create_model("efficientnetv2_s", pretrained=False, num_classes=0)
         self.num_branches = num_branches
+        self.chunk_size = chunk_size
         feature_dim = self.backbone.num_features
 
         self.fc = nn.Linear(feature_dim, 512)
@@ -20,7 +21,7 @@ class Network(nn.Module):
                 nn.Dropout(p=0.5),
                 nn.Linear(256, 256),
                 nn.ReLU(inplace=True),
-                nn.Linear(256, 1)
+                nn.Linear(256, chunk_size)
             )
             for _ in range(num_branches)
         ])
@@ -31,7 +32,7 @@ class Network(nn.Module):
 
         batch_size = x.size(0)
         action_indices = torch.argmax(cmd, dim=1)
-        output = torch.zeros(batch_size, 1, device=x.device, dtype=x.dtype)
+        output = torch.zeros(batch_size, self.chunk_size, device=x.device, dtype=x.dtype)
 
         for idx, branch in enumerate(self.branches):
             mask = (action_indices == idx)

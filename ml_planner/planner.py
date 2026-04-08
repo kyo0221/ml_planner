@@ -67,6 +67,9 @@ class PlannerNode(Node):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = torch.jit.load(weight_path, map_location=self.device)
         self.model.eval()
+        self.model_chunk_size = int(getattr(self.model, 'chunk_size', 1))
+        if self.model_chunk_size < 1:
+            raise ValueError(f'model chunk size must be >= 1, got {self.model_chunk_size}')
 
     def autonomous_callback(self, msg):
         self.autonomous_flag = msg.data
@@ -85,7 +88,7 @@ class PlannerNode(Node):
         command_tensor = self.preprocess_command(command)
 
         with torch.no_grad():
-            output = self.model(image_tensor, command_tensor)
+            output = float(self.model(image_tensor, command_tensor)[0, 0].item())
 
         self.publisher_vel(output)
 
@@ -118,11 +121,11 @@ class PlannerNode(Node):
         command_idx = self.command if command is None else int(command)
         command_tensor[0, command_idx] = 1.0
         return command_tensor
-    
+
     def publisher_vel(self, output):
         twist = Twist()
         twist.linear.x = self.linear_vel
-        twist.angular.z = float(output.squeeze().item())
+        twist.angular.z = float(output)
         self.vel_pub.publish(twist)
 
 
