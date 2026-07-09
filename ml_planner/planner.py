@@ -3,7 +3,8 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 import cv2
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path as NavPath
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
@@ -44,12 +45,12 @@ class PlannerNode(Node):
         ])
 
         self.create_subscription(Bool, '/autonomous', self.autonomous_callback, qos_profile_system_default)
-        self.vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile_system_default)
+        self.path_pub = self.create_publisher(NavPath, '/ml_planner/path', qos_profile_system_default)
         self.debug_image_pub = self.create_publisher(Image, '/ml_planner/place_recognition_debug', qos_profile_system_default)
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
 
     def init_ros_parameter(self):
-        self.linear_vel = float(self.get_parameter('linear_max.vel').value)
+        self.path_frame_id = self.get_parameter('path_frame_id').value
         self.model_path = self.get_parameter('model_name').value
         self.placenet_model_name = self.get_parameter('placenet_model_name').value
         self.topomap_name = self.get_parameter('topomap_dir_name').value
@@ -87,7 +88,7 @@ class PlannerNode(Node):
         with torch.no_grad():
             output = self.model(image_tensor, command_tensor)
 
-        self.publisher_vel(output)
+        self.publish_path(output)
 
     def preprocess_image(self, image):
         image = image[..., :3]
@@ -119,11 +120,17 @@ class PlannerNode(Node):
         command_tensor[0, command_idx] = 1.0
         return command_tensor
     
-    def publisher_vel(self, output):
-        twist = Twist()
-        twist.linear.x = self.linear_vel
-        twist.angular.z = float(output.squeeze().item())
-        self.vel_pub.publish(twist)
+    def publish_path(self, output):
+        path_msg = NavPath()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = self.path_frame_id
+        for x, y in output.squeeze(0).cpu().numpy():
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            path_msg.poses.append(pose)
+        self.path_pub.publish(path_msg)
 
 
 def main(args=None):

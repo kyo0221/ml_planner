@@ -1,6 +1,6 @@
 planner_node:
   ros__parameters:
-    linear_max.vel: 1.0
+    path_frame_id: base_link
     model_name: model.pt
     placenet_model_name: placenet.pt
     topomap_dir_name: topomap
