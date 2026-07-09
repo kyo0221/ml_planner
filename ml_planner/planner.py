@@ -8,7 +8,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_system_default
 from sensor_msgs.msg import Image
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, UInt8
 import torch
 from torchvision import transforms
 
@@ -24,17 +24,20 @@ class PlannerNode(Node):
         super().__init__('planner_node', allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
         self.init_ros_parameter()
         self.init_torch_model()
-        self.zed = ZED_API_Utils()
-        self.placenav = PlaceRecognition(
-            self.placenav_weight_path,
-            self.topomap_path,
-            device=self.device,
-            delta=self.placenet_delta,
-            window_lower=self.placenet_window_lower,
-            window_upper=self.placenet_window_upper,
-        )
+        if self.use_zed:
+            self.zed = ZED_API_Utils()
+        if self.use_topomap:
+            self.placenav = PlaceRecognition(
+                self.placenav_weight_path,
+                self.topomap_path,
+                device=self.device,
+                delta=self.placenet_delta,
+                window_lower=self.placenet_window_lower,
+                window_upper=self.placenet_window_upper,
+            )
 
         self.autonomous_flag = False
+        self.latest_image = None
         self.command = 0
         self.cv_bridge = CvBridge()
         self.placenet_transform = transforms.Compose([
@@ -44,6 +47,8 @@ class PlannerNode(Node):
         ])
 
         self.create_subscription(Bool, '/autonomous', self.autonomous_callback, qos_profile_system_default)
+        self.create_subscription(UInt8, '/command', self.manual_command_callback, qos_profile_system_default)
+        self.create_subscription(Image, '/image_raw', self.image_callback, qos_profile_system_default)
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile_system_default)
         self.debug_image_pub = self.create_publisher(Image, '/ml_planner/place_recognition_debug', qos_profile_system_default)
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
@@ -51,6 +56,8 @@ class PlannerNode(Node):
     def init_ros_parameter(self):
         self.linear_vel = float(self.get_parameter('linear_max.vel').value)
         self.model_path = self.get_parameter('model_name').value
+        self.use_topomap = self.get_parameter('use_topomap').value
+        self.use_zed = self.get_parameter('use_zed').value
         self.placenet_model_name = self.get_parameter('placenet_model_name').value
         self.topomap_name = self.get_parameter('topomap_dir_name').value
         self.placenet_delta = float(self.get_parameter('placenet_delta').value)
@@ -71,21 +78,42 @@ class PlannerNode(Node):
     def autonomous_callback(self, msg):
         self.autonomous_flag = msg.data
 
+    def manual_command_callback(self, msg):
+        self.manual_command = int(msg.data)
+
+    def image_callback(self, msg):
+        image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        h, w = image.shape[:2]
+        target_w, target_h = 512, 288
+        x1 = (w - 512) // 2
+        y1 = (h - 288) // 2
+        cropped = image[y1:y1 + target_h, x1:x1 + target_w].copy()
+        resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        self.latest_image = resized
+
     def timer_callback(self):
-        if not self.autonomous_flag or not self.zed.grab():
+        if not self.autonomous_flag:
             return
 
-        image = self.zed.get_image()
+        if self.use_zed and self.zed.grab():
+            image = self.zed.get_image()
+        else:
+            image = self.latest_image
         image_tensor = self.preprocess_image(image)
         placenet_image_tensor = self.preprocess_placenet_image(image)
 
-        command, idx = self.placenav.get_recognition(placenet_image_tensor)
-        self.get_logger().info(f'place recognition: command={command}, idx={idx}')
+        if self.use_topomap:
+            command, idx = self.placenav.get_recognition(placenet_image_tensor)
+            self.get_logger().info(f'place recognition: command={command}, idx={idx}')
+        else:
+            command = self.manual_command
+            self.get_logger().info(f'manual command: command={command} {self.manual_command}')
+    
         self.publish_place_recognition_debug_image(image, command)
         command_tensor = self.preprocess_command(command)
 
         with torch.no_grad():
-            output = self.model(image_tensor, command_tensor)
+            output = self.model(image_tensor, command_tensor)[0, 0]
 
         self.publisher_vel(output)
 
