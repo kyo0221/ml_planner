@@ -2,6 +2,7 @@ planner_node:
   ros__parameters:
     path_frame_id: base_link
     model_name: model.pt
+    lookahead_distance: 1.5
     linear_max.vel: 1.0
     placenet_model_name: placenet.pt
     use_topomap: false

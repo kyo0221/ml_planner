@@ -1,9 +1,10 @@
+from math import hypot
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 import cv2
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Path as NavPath
 import rclpy
 from rclpy.node import Node
@@ -51,12 +52,14 @@ class PlannerNode(Node):
         self.path_pub = self.create_publisher(NavPath, '/ml_planner/path', qos_profile_system_default)
         self.create_subscription(UInt8, '/command', self.manual_command_callback, qos_profile_system_default)
         self.create_subscription(Image, '/image_raw', self.image_callback, qos_profile_system_default)
+        self.vel_pub = self.create_publisher(Twist, '/cmd_vel', qos_profile_system_default)
         self.debug_image_pub = self.create_publisher(Image, '/ml_planner/place_recognition_debug', qos_profile_system_default)
         self.create_timer(self.interval_ms / 1000.0, self.timer_callback)
 
     def init_ros_parameter(self):
         self.path_frame_id = self.get_parameter('path_frame_id').value
         self.model_path = self.get_parameter('model_name').value
+        self.lookahead_distance = float(self.get_parameter('lookahead_distance').value)
         self.use_topomap = self.get_parameter('use_topomap').value
         self.use_zed = self.get_parameter('use_zed').value
         self.placenet_model_name = self.get_parameter('placenet_model_name').value
@@ -116,7 +119,8 @@ class PlannerNode(Node):
         with torch.no_grad():
             output = self.model(image_tensor, command_tensor)[0, 0]
 
-        self.publish_path(output)
+        path = self.publish_path(output)
+        self.publish_vel(path)
 
     def preprocess_image(self, image):
         image = image[..., :3]
@@ -159,6 +163,42 @@ class PlannerNode(Node):
             pose.pose.position.y = float(y)
             path_msg.poses.append(pose)
         self.path_pub.publish(path_msg)
+        return path_msg
+    
+    def publish_vel(self, path_msg):
+        if len(path_msg.poses) < 2:
+            return
+
+        target_pose = path_msg.poses[-1].pose.position
+        accumulated_distance = 0.0
+        previous_pose = path_msg.poses[0].pose.position
+
+        for pose_stamped in path_msg.poses[1:]:
+            current_pose = pose_stamped.pose.position
+            segment_distance = hypot(
+                current_pose.x - previous_pose.x,
+                current_pose.y - previous_pose.y,
+            )
+
+            if accumulated_distance + segment_distance >= self.lookahead_distance:
+                remaining_distance = self.lookahead_distance - accumulated_distance
+                interpolation = 0.0 if segment_distance == 0.0 else remaining_distance / segment_distance
+                target_pose = type(current_pose)()
+                target_pose.x = previous_pose.x + (current_pose.x - previous_pose.x) * interpolation
+                target_pose.y = previous_pose.y + (current_pose.y - previous_pose.y) * interpolation
+                break
+
+            accumulated_distance += segment_distance
+            previous_pose = current_pose
+
+        target_distance = hypot(target_pose.x, target_pose.y)
+        if target_distance == 0.0:
+            return
+
+        vel_msg = Twist()
+        vel_msg.linear.x = min(target_distance * 5.0, self.get_parameter('linear_max.vel').value)
+        vel_msg.angular.z = 2.0 * vel_msg.linear.x * target_pose.y / max(target_distance ** 2, 1e-6)
+        self.vel_pub.publish(vel_msg)
 
 
 def main(args=None):
